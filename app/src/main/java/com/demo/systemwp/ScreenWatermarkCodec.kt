@@ -13,12 +13,12 @@ import kotlin.math.abs
  * 这里改用「棋盘调制」：每个 4×4 小块内亮/暗各半，局部均值为零，
  * 人眼看到的是不可见的均匀噪声，而截图像素里留下了可用相关法检测的痕迹。
  *
- * 纹理由一块 tile 平铺得到：64×64 个 chip，其中前 512 个 chip 承载 32 比特头部
+ * 纹理由一块 tile 平铺得到：56×56 个 chip，其中前 512 个 chip 承载 32 比特头部
  * （每比特 16 次重复），剩余 chip 全部平均分给正文比特做重复（载荷越短，重复次数越多）；
  * 整屏铺满后同一槽位会被观测数次到数十次，靠累加取信。
  *
- * 限制：只对「原生分辨率、无损格式」的截屏有效。缩放、JPEG 二次压缩、
- * 翻拍都会破坏 4 像素级的棋盘，属物理上限而非实现问题。
+ * 支持保留足够头部与正文的裁剪图。缩放、JPEG 二次压缩、
+ * 翻拍可能削弱或破坏 4 像素级棋盘，不能保证恢复。
  */
 object ScreenWatermarkCodec {
 
@@ -35,10 +35,6 @@ object ScreenWatermarkCodec {
      * 原来的逐像素交替是 2 像素周期（Nyquist），任何重采样都会把它平均成灰。
      */
     private const val SUB_BLOCK = 2
-
-    /** 相位搜索用的行数与采样步长（只用于粗定位，精度足够且快）。 */
-    private const val SEARCH_ROWS = 192
-    private const val SEARCH_STEP = 2
 
     /** tile 内的 chip 数（每边）。tile 必须小于屏幕，否则边缘槽位永远采不到样本。 */
     private const val TILE_CHIPS = 56
@@ -75,9 +71,7 @@ object ScreenWatermarkCodec {
     private const val MAGIC_0: Byte = 0x57 // 'W'
     private const val MAGIC_1: Byte = 0x44 // 'D'
 
-    private const val BAND_ROWS = 128
-
-    /** 低于该尺寸的图不可能包含完整相位信息。 */
+    /** 过滤无法可靠定位的过小输入。 */
     private const val MIN_DETECT_SIDE = 64
 
     /** 把密文包装进 tile；容量不足或载荷非法时返回 null。 */
@@ -129,8 +123,17 @@ object ScreenWatermarkCodec {
     fun createShader(tile: Bitmap): BitmapShader =
         BitmapShader(tile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
 
-    /** 检测结果：命中时 [payload] 非空；[score] 恒为头部相关强度，可用于判断“有没有信号”。 */
-    data class Detection(val payload: WatermarkPayload?, val score: Double)
+    /** 只有通过解密认证的结果才返回身份；其余状态仅供诊断。 */
+    enum class Status { SUCCESS, NOT_FOUND, INSUFFICIENT_DATA, VALIDATION_FAILED }
+
+    data class Detection(
+        val payload: WatermarkPayload?,
+        val score: Double,
+        val status: Status = if (payload != null) Status.SUCCESS else Status.NOT_FOUND,
+        val headerBitsObserved: Int = 0,
+        val bodyBitsObserved: Int = 0,
+        val bodyBitsRequired: Int = 0
+    )
 
     /** 由截图还原载荷；无有效水印时返回 null。 */
     fun extract(bitmap: Bitmap): WatermarkPayload? = detect(bitmap).payload
@@ -141,29 +144,123 @@ object ScreenWatermarkCodec {
             return Detection(null, 0.0)
         }
 
-        // 先枚举棋盘相位（chip 网格 + 子块网格），取头部相关最强的那一个
-        var bestShiftX = 0
-        var bestShiftY = 0
-        var bestScore = Double.NEGATIVE_INFINITY
-        val bandRows = minOf(bitmap.height, SEARCH_ROWS)
-        for (shiftY in 0 until CHIP_SIZE) {
-            for (shiftX in 0 until CHIP_SIZE) {
-                val score = headerScore(
-                    accumulate(bitmap, shiftX, shiftY, bandRows, SEARCH_STEP)
-                )
-                if (score > bestScore) {
-                    bestScore = score
-                    bestShiftX = shiftX
-                    bestShiftY = shiftY
+        // 常见的未裁剪原图先走快速路径。
+        val original = accumulate(bitmap, 0, 0, bitmap.height, 1)
+        val direct = inspect(original)
+        if (direct.payload != null) return direct
+
+        // 像素相位只需累加一次；整 chip 的平移通过重排槽位搜索，
+        // 避免对 672×672 个偏移反复扫描整张图片。
+        data class Candidate(val x: Int, val y: Int, val score: Double)
+        val coarse = ArrayList<Candidate>()
+        for (py in 0 until CHIP_SIZE) {
+            for (px in 0 until CHIP_SIZE) {
+                val acc = accumulate(bitmap, px, py, bitmap.height, 2)
+                for (cy in 0 until TILE_CHIPS) {
+                    for (cx in 0 until TILE_CHIPS) {
+                        val score = syncScore(acc, cx, cy)
+                        if (score > 0.0) coarse.add(
+                            Candidate(px + cx * CHIP_SIZE, py + cy * CHIP_SIZE, score)
+                        )
+                    }
                 }
+                // 每个相位后裁掉弱候选，限制内存与后续精定位开销。
+                coarse.sortByDescending { it.score }
+                if (coarse.size > 24) coarse.subList(24, coarse.size).clear()
             }
         }
 
-        // 再整屏累加一次，利用 tile 的重复获得几十次观测
-        val acc = accumulate(bitmap, bestShiftX, bestShiftY, bitmap.height, 1)
-        val score = headerScore(acc)
+        val offsets = coarse.map { it.x to it.y }
+        var best = direct
+        // 按像素相位分组，精定位也只为每个相位扫描一次图片。
+        for ((phase, positions) in offsets.groupBy { (x, y) ->
+            (x % CHIP_SIZE) to (y % CHIP_SIZE)
+        }) {
+            val acc = if (phase.first == 0 && phase.second == 0) original
+                else accumulate(bitmap, phase.first, phase.second, bitmap.height, 1)
+            for ((x, y) in positions) {
+                val shifted = translate(acc, x / CHIP_SIZE, y / CHIP_SIZE)
+                val result = inspect(shifted)
+                if (result.payload != null) return result
+                // 完整、合法的头部比单纯相关分数更有诊断价值。
+                if (result.status.ordinal > best.status.ordinal ||
+                    (result.status == best.status && result.score > best.score)) best = result
+            }
+        }
+        return best
+    }
+
+    private val magicBits = WatermarkBits.bytesToBits(byteArrayOf(MAGIC_0, MAGIC_1))
+    private val pn = IntArray(TILE_SLOTS) { WatermarkBits.pnSign(it) }
+
+    private fun sourceSlot(slot: Int, cx: Int, cy: Int): Int =
+        Math.floorMod(slot / TILE_CHIPS - cy, TILE_CHIPS) * TILE_CHIPS +
+            Math.floorMod(slot % TILE_CHIPS - cx, TILE_CHIPS)
+
+    /** 已知 magic 的有符号相关；覆盖过少的候选不能参加定位。 */
+    private fun syncScore(acc: Accumulator, cx: Int = 0, cy: Int = 0): Double {
+        var sum = 0.0
+        var count = 0
+        var bits = 0
+        for (g in magicBits.indices) {
+            var observed = false
+            val sign = if (magicBits[g] == 1) 1 else -1
+            for (r in 0 until HEADER_REPEAT) {
+                val slot = g * HEADER_REPEAT + r
+                val source = sourceSlot(slot, cx, cy)
+                if (acc.weight[source] > 0.0) {
+                    sum += sign * pn[slot] * acc.sum[source] / acc.weight[source]
+                    count++
+                    observed = true
+                }
+            }
+            if (observed) bits++
+        }
+        return if (bits < 12 || count < 64) 0.0
+            else sum / count * kotlin.math.sqrt(count.toDouble() / (16 * HEADER_REPEAT))
+    }
+
+    private fun translate(acc: Accumulator, cx: Int, cy: Int): Accumulator {
+        val result = Accumulator()
+        for (slot in 0 until TILE_SLOTS) {
+            val source = sourceSlot(slot, cx, cy)
+            result.sum[slot] = acc.sum[source]
+            result.weight[slot] = acc.weight[source]
+        }
+        return result
+    }
+
+    private fun observedBits(acc: Accumulator, first: Int, bits: Int, repeat: Int): Int =
+        (0 until bits).count { bit ->
+            (0 until repeat).any { acc.weight[first + bit * repeat + it] > 0.0 }
+        }
+
+    private fun inspect(acc: Accumulator): Detection {
+        val score = syncScore(acc)
+        val headerObserved = observedBits(acc, 0, HEADER_BITS, HEADER_REPEAT)
+        val header = WatermarkBits.bitsToBytes(
+            IntArray(HEADER_BITS) { readBit(acc, it * HEADER_REPEAT, HEADER_REPEAT) }
+        )
+        val magicObserved = observedBits(acc, 0, 16, HEADER_REPEAT)
+        val magicMatches = magicObserved == 16 && header[0] == MAGIC_0 && header[1] == MAGIC_1
+        if (!magicMatches) return Detection(null, score, headerBitsObserved = headerObserved)
+        if (headerObserved < HEADER_BITS) return Detection(
+            null, score, Status.INSUFFICIENT_DATA, headerObserved
+        )
+        val length = ((header[2].toInt() and 255) shl 8) or (header[3].toInt() and 255)
+        if (length !in 1..MAX_BODY_BYTES) return Detection(
+            null, score, headerBitsObserved = headerObserved
+        )
+        val bits = length * 8
+        val repeat = bodyRepeat(bits)
+        val observed = observedBits(acc, HEADER_SLOTS, bits, repeat)
+        if (observed < bits) return Detection(
+            null, score, Status.INSUFFICIENT_DATA, headerObserved, observed, bits
+        )
         val payload = decodeFrom(acc)
-        return Detection(payload, score)
+        return Detection(payload, score,
+            if (payload != null) Status.SUCCESS else Status.VALIDATION_FAILED,
+            headerObserved, observed, bits)
     }
 
     private fun decodeFrom(acc: Accumulator): WatermarkPayload? {
@@ -213,39 +310,31 @@ object ScreenWatermarkCodec {
         val limit = minOf(rows, bitmap.height)
         if (limit <= 0 || width < 2) return acc
 
-        val bandRows = minOf(limit, BAND_ROWS)
-        val band = IntArray(width * bandRows)
-        var y0 = 0
-        while (y0 < limit) {
-            val height = minOf(bandRows, limit - y0)
-            bitmap.getPixels(band, 0, width, 0, y0, width, height)
-            for (row in 0 until height step step) {
-                val y = y0 + row
-                val chipRow = (((y + shiftY) / CHIP_SIZE) % TILE_CHIPS) * TILE_CHIPS
-                val subRow = (y + shiftY) / SUB_BLOCK
-                val base = row * width
-                val nextBase = if (row + 1 < height) base + width else -1
-                for (x in 0 until width step step) {
-                    val slot = chipRow + ((x + shiftX) / CHIP_SIZE) % TILE_CHIPS
-                    val luminance = (band[base + x] ushr 8) and 0xFF
-                    val sub = (x + shiftX) / SUB_BLOCK + subRow
-                    val check = if ((sub and 1) == 0) 1 else -1
-
-                    var gradient = 0
-                    if (x + 1 < width) {
-                        gradient += abs(luminance - ((band[base + x + 1] ushr 8) and 0xFF))
-                    }
-                    if (nextBase >= 0) {
-                        gradient += abs(luminance - ((band[nextBase + x] ushr 8) and 0xFF))
-                    }
-                    val normalized = gradient / GRADIENT_SCALE
-                    val weight = 1.0 / (1.0 + normalized * normalized)
-
-                    acc.sum[slot] += luminance.toDouble() * check * weight
-                    acc.weight[slot] += weight
+        // 完整 4×4 棋盘块作差；统一权重保证背景均值抵消，丢弃不完整边缘块。
+        val period = SUB_BLOCK * 2
+        val startX = Math.floorMod(-shiftX, period)
+        val startY = Math.floorMod(-shiftY, period)
+        val blockRows = IntArray(width * period)
+        for (y in startY..(limit - period) step (period * step)) {
+            bitmap.getPixels(blockRows, 0, width, 0, y, width, period)
+            val chipRow = ((y + shiftY) / CHIP_SIZE % TILE_CHIPS) * TILE_CHIPS
+            for (x in startX..(width - period) step (period * step)) {
+                var contrast = 0.0
+                var gradient = 0
+                for (dy in 0 until period) for (dx in 0 until period) {
+                    val index = dy * width + x + dx
+                    val value = (blockRows[index] ushr 8) and 255
+                    val sign = if (((dx / SUB_BLOCK + dy / SUB_BLOCK) and 1) == 0) 1 else -1
+                    contrast += value * sign
+                    if (dx + 1 < period) gradient += abs(value - ((blockRows[index + 1] ushr 8) and 255))
+                    if (dy + 1 < period) gradient += abs(value - ((blockRows[index + width] ushr 8) and 255))
                 }
+                val normalized = gradient / (24.0 * GRADIENT_SCALE)
+                val weight = 1.0 / (1.0 + normalized * normalized)
+                val slot = chipRow + (x + shiftX) / CHIP_SIZE % TILE_CHIPS
+                acc.sum[slot] += contrast / (period * period) * weight
+                acc.weight[slot] += weight
             }
-            y0 += height
         }
         return acc
     }
@@ -260,26 +349,6 @@ object ScreenWatermarkCodec {
             }
         }
         return if (sum > 0) 1 else 0
-    }
-
-    /**
-     * 头部相关强度，用来挑选棋盘相位、也作为失败时的诊断值。
-     * 有信号时约等于调制幅度（灰度级数），无信号时在 0 附近。
-     */
-    private fun headerScore(acc: Accumulator): Double {
-        var score = 0.0
-        for (g in 0 until HEADER_BITS) {
-            var sum = 0.0
-            for (r in 0 until HEADER_REPEAT) {
-                val slot = g * HEADER_REPEAT + r
-                val weight = acc.weight[slot]
-                if (weight > 0.0) {
-                    sum += WatermarkBits.pnSign(slot) * (acc.sum[slot] / weight)
-                }
-            }
-            score += abs(sum)
-        }
-        return score / (HEADER_BITS * HEADER_REPEAT)
     }
 
     /**

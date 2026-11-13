@@ -215,37 +215,44 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * 悬浮层是按「逻辑分辨率」绘制的，截屏却是「物理分辨率」。
-     * 两者不一致（改过显示大小 / 模拟器按比例缩放）时，2 像素周期的棋盘会被重采样平均掉，
-     * 这里先等比缩回逻辑分辨率（只能改善对齐，无法恢复已丢失的高频信息）。
-     */
-    private fun fitToScreen(bitmap: Bitmap): Bitmap? {
+    /** 原图优先；缩放比例来自显示参数或完整截图比例，不能把裁剪尺寸当作屏幕尺寸。 */
+    private fun detectScreenWatermark(bitmap: Bitmap): ScreenWatermarkCodec.Detection {
+        var best = ScreenWatermarkCodec.detect(bitmap)
+        if (best.payload != null) return best
         val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        Log.i(
-            LOG_TAG,
-            "screen=${width}x$height dpi=${metrics.densityDpi} density=${metrics.density} " +
-                "physical=${physicalSize()}"
-        )
-        if (width <= 0 || height <= 0) return bitmap
-        if (bitmap.width == width && bitmap.height == height) return bitmap
-
-        Log.i(LOG_TAG, "resample ${bitmap.width}x${bitmap.height} -> ${width}x$height")
-        return try {
-            Bitmap.createScaledBitmap(bitmap, width, height, true)
-        } catch (_: OutOfMemoryError) {
-            null
+        val mode = getSystemService(DisplayManager::class.java)
+            ?.getDisplay(Display.DEFAULT_DISPLAY)?.mode
+        val scales = mutableListOf<Double>()
+        if (mode != null && mode.physicalWidth > 0 && mode.physicalHeight > 0) {
+            val sx = metrics.widthPixels.toDouble() / mode.physicalWidth
+            val sy = metrics.heightPixels.toDouble() / mode.physicalHeight
+            if (kotlin.math.abs(sx - sy) < 0.01) scales.add(sx)
         }
+        // 仅纵横比相符时，把“完整截图经过等比缩放”作为额外假设。
+        val sx = metrics.widthPixels.toDouble() / bitmap.width
+        val sy = metrics.heightPixels.toDouble() / bitmap.height
+        if (kotlin.math.abs(sx - sy) / maxOf(sx, sy) < 0.005) scales.add(sx)
+        val tried = mutableListOf<Double>()
+        for (scale in scales) {
+            if (!scale.isFinite() || scale <= 0 || kotlin.math.abs(scale - 1.0) < 0.001 ||
+                tried.any { kotlin.math.abs(it - scale) < 0.001 }) continue
+            tried.add(scale)
+            val width = kotlin.math.round(bitmap.width * scale).toInt()
+            val height = kotlin.math.round(bitmap.height * scale).toInt()
+            if (width < 64 || height < 64 || width.toLong() * height > MAX_DECODE_PIXELS) continue
+            Log.i(LOG_TAG, "uniform resample ${bitmap.width}x${bitmap.height} -> ${width}x$height")
+            val scaled = Bitmap.createScaledBitmap(bitmap, width, height, true)
+            val result = try {
+                ScreenWatermarkCodec.detect(scaled)
+            } finally {
+                if (scaled !== bitmap) scaled.recycle()
+            }
+            if (result.payload != null) return result
+            if (result.status.ordinal > best.status.ordinal ||
+                (result.status == best.status && result.score > best.score)) best = result
+        }
+        return best
     }
-
-    private fun physicalSize(): String {
-        val display = getSystemService(DisplayManager::class.java)?.getDisplay(Display.DEFAULT_DISPLAY)
-        val mode = display?.mode ?: return "unknown"
-        return "${mode.physicalWidth}x${mode.physicalHeight}"
-    }
-
     private fun decodeAndExtract(uri: Uri): String {
         return try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -263,7 +270,7 @@ class MainActivity : AppCompatActivity() {
 
             // 只解码一次，两种水印共用：屏幕暗水印（截屏）与 LSB 盲水印（图片文件）
             val bitmap = if (tooLarge) null else decodeBitmap(uri)
-            val screenDetection = bitmap?.let { fitToScreen(it)?.let { b -> ScreenWatermarkCodec.detect(b) } }
+            val screenDetection = bitmap?.let { detectScreenWatermark(it) }
             val screenPayload = screenDetection?.payload
             val lsbPayload = bitmap?.let { WatermarkCodec.extract(it) }
             val mimeType = bounds.outMimeType.orEmpty()
@@ -298,25 +305,31 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     else -> {
-                        appendLine("未检测到水印。")
-                        appendLine("屏幕暗水印相关强度：${formatScore(screenDetection?.score ?: 0.0)}")
-                        if (resampled) {
-                            appendLine(
-                                "截图 ${width}x$height 与屏幕 ${displayWidth}x${displayHeight} 不一致" +
-                                    "（${formatScale(width, displayWidth)}×）：" +
-                                    "像素级暗水印已被重采样抹掉，请用 1:1 截图的设备再验证。"
-                            )
-                        } else if (isLossyFormat(mimeType)) {
-                            appendLine(
-                                "该图片是有损格式（$mimeType），肉眼不可见的调制会被压缩抹掉，" +
-                                    "请用系统截屏产生的 PNG 原图再试。"
-                            )
-                        } else {
-                            appendLine(
-                                "截图分辨率与屏幕一致，但未检出信号：" +
-                                    "请确认水印服务正在运行（通知栏应有常驻通知）。"
-                            )
+                        when (screenDetection?.status) {
+                            ScreenWatermarkCodec.Status.INSUFFICIENT_DATA -> {
+                                appendLine("检测到疑似水印头部，但截图保留的数据不足，无法还原身份。")
+                                appendLine("头部覆盖：${screenDetection.headerBitsObserved}/32 比特")
+                                if (screenDetection.bodyBitsRequired > 0) appendLine(
+                                    "正文覆盖：${screenDetection.bodyBitsObserved}/${screenDetection.bodyBitsRequired} 比特"
+                                )
+                                appendLine("请保留更大的截图区域后重试。")
+                            }
+                            ScreenWatermarkCodec.Status.VALIDATION_FAILED -> {
+                                appendLine("检测到疑似水印头部，但载荷校验未通过。")
+                                appendLine("可能存在像素损坏、识别误差，或图片使用了其他密钥。")
+                            }
+                            else -> {
+                                appendLine("未定位到可验证的水印。")
+                                appendLine("裁剪可能移除了定位头部；请尝试保留更大的区域，并确认水印已开启。")
+                            }
                         }
+                        appendLine("水印同步相关强度：${formatScore(screenDetection?.score ?: 0.0)}")
+                        if (resampled) appendLine(
+                            "图片尺寸与当前屏幕不同，已优先按原图解析，并尝试适用的等比缩放。"
+                        )
+                        if (isLossyFormat(mimeType)) appendLine(
+                            "该图片格式可能包含有损压缩（$mimeType），建议使用 PNG 原图。"
+                        )
                     }
                 }
             }
@@ -338,10 +351,7 @@ class MainActivity : AppCompatActivity() {
     private fun formatScore(score: Double): String =
         String.format(Locale.US, "%.2f", score)
 
-    private fun formatScale(actual: Int, expected: Int): String =
-        if (expected <= 0) "?" else String.format(Locale.US, "%.2f", actual.toDouble() / expected)
-
-    /** 有损格式会抹掉几个灰阶级别的调制，直接判定为不可恢复。 */
+    /** 这些格式可能采用有损编码，仅作为建议，不据此判断水印已丢失。 */
     private fun isLossyFormat(mimeType: String): Boolean {
         val type = mimeType.lowercase(Locale.US)
         return type.contains("jpeg") || type.contains("jpg") ||
