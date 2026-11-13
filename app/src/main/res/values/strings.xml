@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">隐形水印</string>
+    <string name="title">屏幕隐形水印</string>
+    <string name="label_username">用户名</string>
+    <string name="label_device_id">设备 ID</string>
+    <string name="hint_username">输入用户名</string>
+    <string name="hint_device_id">输入设备 ID</string>
+    <string name="toggle_off">水印：已关闭（点击开启）</string>
+    <string name="toggle_on">水印：已开启（点击关闭）</string>
+    <string name="toggle_grant">水印：已开启（点击授权悬浮窗）</string>
+    <string name="pick_image">选择图片进行解析</string>
+    <string name="processing">处理中…</string>
+    <string name="grant_overlay">请先在系统设置中授予“显示在其他应用上层”权限</string>
+    <string name="watermark_running">屏幕水印运行中</string>
+    <string name="debug_on">调试：暗水印已临时可见，再长按可恢复隐形</string>
+    <string name="debug_off">调试：暗水印已恢复隐形</string>
+</resources>
