@@ -293,7 +293,7 @@ class MainActivity : AppCompatActivity() {
                         appendLine("检测到屏幕暗水印：")
                         appendLine("用户名：${screenPayload.userId.ifEmpty { "（未填写）" }}")
                         appendLine("设备 ID：${screenPayload.deviceId.ifEmpty { "（未填写）" }}")
-                        appendLine("生成时间：${formatTimestamp(screenPayload.timestamp)}")
+                        appendLine("时间戳：${formatTimestamp(screenPayload.timestamp)}")
                         appendLine("（载荷由本机 Keystore 密钥加密，仅本机可解）")
                     }
 

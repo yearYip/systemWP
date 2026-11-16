@@ -14,6 +14,7 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -144,7 +145,7 @@ class WatermarkService : Service() {
      * 幅度约 [ScreenWatermarkCodec.OVERLAY_ALPHA] 个灰阶且小块内局部均值为零，
      * 正常观看距离下不可见，但屏幕像素里真实存在，截屏后可被本应用相关检测还原。
      *
-     * 用户名/设备 ID 变化时在下一帧重建 tile，因此界面改完立即生效。
+     * 用户名/设备 ID 变化时在下一帧重建 tile；身份未变时每分钟更新时间戳。
      */
     private class WatermarkView(context: Context) : View(context) {
 
@@ -157,6 +158,24 @@ class WatermarkService : Service() {
 
         private var shader: BitmapShader? = null
         private var identity: String? = null
+        private var lastBuiltAt = 0L
+        private val refreshWatermark = object : Runnable {
+            override fun run() {
+                invalidate()
+                postDelayed(this, REFRESH_INTERVAL_MS)
+            }
+        }
+
+        override fun onAttachedToWindow() {
+            super.onAttachedToWindow()
+            invalidate()
+            postDelayed(refreshWatermark, REFRESH_INTERVAL_MS)
+        }
+
+        override fun onDetachedFromWindow() {
+            removeCallbacks(refreshWatermark)
+            super.onDetachedFromWindow()
+        }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
@@ -173,18 +192,23 @@ class WatermarkService : Service() {
             return if (debug > 0) debug else ScreenWatermarkCodec.OVERLAY_ALPHA
         }
 
-        /** 身份未变则复用上一次的 tile，避免每帧做加密与位图生成。 */
+        /** 身份未变且未满一分钟时复用 tile；使用单调时钟判断刷新间隔。 */
         private fun currentShader(): BitmapShader? {
             val prefs = WatermarkPrefs.prefs(context)
             val userId = prefs.getString(WatermarkPrefs.KEY_USERNAME, "").orEmpty()
             val deviceId = prefs.getString(WatermarkPrefs.KEY_DEVICE_ID, "").orEmpty()
             val next = "$userId\u0000$deviceId"
-            if (next == identity) return shader
+            if (next == identity &&
+                SystemClock.elapsedRealtime() - lastBuiltAt < REFRESH_INTERVAL_MS
+            ) return shader
 
             // 构建失败时不缓存身份，下一帧继续重试
             val built = build(userId, deviceId) ?: return null
             identity = next
             shader = built
+            lastBuiltAt = SystemClock.elapsedRealtime()
+            removeCallbacks(refreshWatermark)
+            postDelayed(refreshWatermark, REFRESH_INTERVAL_MS)
             return built
         }
 
@@ -214,6 +238,7 @@ class WatermarkService : Service() {
     companion object {
         private const val CHANNEL_ID = "watermark"
         private const val NOTIFICATION_ID = 1
+        private const val REFRESH_INTERVAL_MS = 60_000L
 
         /**
          * WindowManager.LayoutParams.TYPE_INTERNAL_SYSTEM_WINDOW 的数值。
