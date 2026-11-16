@@ -10,6 +10,8 @@
     <string name="toggle_on">水印：已开启（点击关闭）</string>
     <string name="toggle_grant">水印：已开启（点击授权悬浮窗）</string>
     <string name="pick_image">选择图片进行解析</string>
+    <string name="pick_video">录屏水印解析</string>
+    <string name="processing_video">正在解析录屏：%1$d / %2$d 帧</string>
     <string name="processing">处理中…</string>
     <string name="grant_overlay">请先在系统设置中授予“显示在其他应用上层”权限</string>
     <string name="watermark_running">屏幕水印运行中</string>

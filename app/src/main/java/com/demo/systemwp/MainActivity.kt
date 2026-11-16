@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.hardware.display.DisplayManager
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -18,13 +19,18 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.widget.doAfterTextChanged
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
@@ -40,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvResult: TextView
 
     private var startIssued = false
+    private var parseJob: Job? = null
 
     private val identityHandler = Handler(Looper.getMainLooper())
 
@@ -56,6 +63,11 @@ class MainActivity : AppCompatActivity() {
     private val pickImage =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
             uri?.let { parseImage(it) }
+        }
+
+    private val pickVideo =
+        registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+            uri?.let { parseVideo(it) }
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -79,6 +91,9 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<Button>(R.id.btn_pick).setOnClickListener {
             pickImage.launch("image/*")
+        }
+        findViewById<Button>(R.id.btn_pick_video).setOnClickListener {
+            pickVideo.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly))
         }
         watchIdentityChanges()
     }
@@ -198,12 +213,144 @@ class MainActivity : AppCompatActivity() {
     // ---------------------------------------------------------------- 水印解析
 
     private fun parseImage(uri: Uri) {
+        parseJob?.cancel()
         tvResult.setText(R.string.processing)
-        lifecycleScope.launch {
+        parseJob = lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) { decodeAndExtract(uri) }
             tvResult.text = result
         }
     }
+
+    private fun parseVideo(uri: Uri) {
+        parseJob?.cancel()
+        tvResult.setText(R.string.processing)
+        parseJob = lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                decodeAndExtractVideo(uri) { current, total ->
+                    withContext(Dispatchers.Main) {
+                        tvResult.text = getString(R.string.processing_video, current, total)
+                    }
+                }
+            }
+            tvResult.text = result
+        }
+    }
+
+    /** 短视频约每五秒取一帧，长视频均匀采样；找到首个通过认证的水印后停止。 */
+    private suspend fun decodeAndExtractVideo(
+        uri: Uri,
+        onProgress: suspend (Int, Int) -> Unit
+    ): String {
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(this, uri)
+            val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()?.takeIf { it > 0 }
+                ?: return "解析失败：无法读取视频时长"
+            val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                ?.toIntOrNull() ?: 0
+            val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                ?.toIntOrNull() ?: 0
+            if (width.toLong() * height > MAX_DECODE_PIXELS) {
+                return "解析失败：视频分辨率过大，请选择较低分辨率的录屏"
+            }
+            val sampleCount = minOf(
+                MAX_VIDEO_FRAMES.toLong(),
+                (duration - 1) / VIDEO_FRAME_INTERVAL_MS + 2
+            ).toInt()
+            // 包含开头与结尾；极短视频去重，避免反复解析同一个位置。
+            val positions = (0 until sampleCount).map {
+                it.toLong() * (duration - 1) / (sampleCount - 1)
+            }.distinct()
+            var decodedFrames = 0
+            var failedFrames = 0
+            var best: ScreenWatermarkCodec.Detection? = null
+            for ((index, position) in positions.withIndex()) {
+                currentCoroutineContext().ensureActive()
+                onProgress(index + 1, positions.size)
+                val frame = try {
+                    retriever.getFrameAtTime(position * 1_000, MediaMetadataRetriever.OPTION_CLOSEST)
+                } catch (e: Exception) {
+                    Log.w(LOG_TAG, "video frame unavailable at ${position}ms", e)
+                    null
+                }
+                if (frame == null) {
+                    failedFrames++
+                    continue
+                }
+                val detection = try {
+                    currentCoroutineContext().ensureActive()
+                    if (frame.width.toLong() * frame.height > MAX_DECODE_PIXELS) {
+                        failedFrames++
+                        continue
+                    }
+                    decodedFrames++
+                    detectScreenWatermark(frame)
+                } finally {
+                    frame.recycle()
+                }
+                val payload = detection.payload
+                if (payload != null) {
+                    return buildString {
+                        appendLine("录屏解析结果：")
+                        appendLine("视频尺寸：$width x $height")
+                        appendLine("视频时长：${formatVideoPosition(duration)}")
+                        appendLine("抽帧位置（约）：${formatVideoPosition(position)}")
+                        appendLine("已解析帧数：$decodedFrames")
+                        appendLine()
+                        appendLine("检测到屏幕暗水印：")
+                        appendLine("用户名：${payload.userId.ifEmpty { "（未填写）" }}")
+                        appendLine("设备 ID：${payload.deviceId.ifEmpty { "（未填写）" }}")
+                        appendLine("时间戳：${formatTimestamp(payload.timestamp)}")
+                        appendLine("已找到首个有效水印，停止抽帧。")
+                        appendLine("（载荷由本机 Keystore 密钥加密，仅本机可解）")
+                    }
+                }
+                val previous = best
+                if (previous == null || detection.status.ordinal > previous.status.ordinal ||
+                    (detection.status == previous.status && detection.score > previous.score)
+                ) best = detection
+            }
+            return buildString {
+                appendLine("录屏解析结果：")
+                appendLine("视频尺寸：$width x $height")
+                appendLine("视频时长：${formatVideoPosition(duration)}")
+                appendLine("已解析帧数：$decodedFrames / ${positions.size}")
+                if (failedFrames > 0) appendLine("无法读取或尺寸过大的帧：$failedFrames")
+                appendLine()
+                if (decodedFrames == 0) {
+                    appendLine("未能读取可解析的视频帧，请检查视频是否损坏或格式是否受支持。")
+                } else {
+                    when (best?.status) {
+                        ScreenWatermarkCodec.Status.INSUFFICIENT_DATA ->
+                            appendLine("抽样帧中检测到疑似水印头部，但数据不足，无法还原身份。")
+                        ScreenWatermarkCodec.Status.VALIDATION_FAILED ->
+                            appendLine("抽样帧中检测到疑似水印头部，但载荷校验未通过。")
+                        else -> appendLine("抽样帧中未定位到可验证的水印。")
+                    }
+                    appendLine("水印同步相关强度：${formatScore(best?.score ?: 0.0)}")
+                    appendLine("录屏压缩、缩放或裁剪可能削弱水印，建议使用原始高画质录屏。")
+                    appendLine("结果仅覆盖抽样帧，不能据此判断整段视频不存在水印。")
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: OutOfMemoryError) {
+            return "解析失败：视频帧过大，内存不足"
+        } catch (e: Exception) {
+            return "录屏解析失败：${e.message ?: "无法读取视频"}"
+        } finally {
+            try {
+                retriever.release()
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "video retriever release failed", e)
+            }
+        }
+    }
+
+    private fun formatVideoPosition(millis: Long): String =
+        String.format(Locale.US, "%02d:%02d:%02d.%03d",
+            millis / 3_600_000, millis / 60_000 % 60, millis / 1_000 % 60, millis % 1_000)
 
     /** 解码整图（不缩放），因为盲水印的 LSB 位置依赖原始尺寸。 */
     private fun decodeBitmap(uri: Uri): Bitmap? {
@@ -375,5 +522,7 @@ class MainActivity : AppCompatActivity() {
 
         /** 超过该像素数不整图解码，避免 OOM（盲水印提取要求原尺寸，故仅提示）。 */
         private const val MAX_DECODE_PIXELS = 20_000_000L
+        private const val VIDEO_FRAME_INTERVAL_MS = 5_000L
+        private const val MAX_VIDEO_FRAMES = 120
     }
 }
