@@ -47,6 +47,7 @@ class MainActivity : AppCompatActivity() {
 
     private var startIssued = false
     private var parseJob: Job? = null
+    private lateinit var btnCancelParse: Button
 
     private val identityHandler = Handler(Looper.getMainLooper())
 
@@ -80,6 +81,12 @@ class MainActivity : AppCompatActivity() {
         etDeviceId = findViewById(R.id.et_device_id)
         btnToggle = findViewById(R.id.btn_toggle)
         tvResult = findViewById(R.id.tv_result)
+        btnCancelParse = findViewById(R.id.btn_cancel_parse)
+        btnCancelParse.setOnClickListener {
+            parseJob?.cancel()
+            btnCancelParse.visibility = android.view.View.GONE
+            tvResult.setText(R.string.parse_cancelled)
+        }
 
         etUsername.setText(prefs.getString(WatermarkPrefs.KEY_USERNAME, ""))
         etDeviceId.setText(prefs.getString(WatermarkPrefs.KEY_DEVICE_ID, ""))
@@ -214,32 +221,49 @@ class MainActivity : AppCompatActivity() {
 
     private fun parseImage(uri: Uri) {
         parseJob?.cancel()
+        btnCancelParse.visibility = android.view.View.VISIBLE
         tvResult.setText(R.string.processing)
         parseJob = lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) { decodeAndExtract(uri) }
-            tvResult.text = result
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    decodeAndExtract(uri) { progress ->
+                        withContext(Dispatchers.Main) { tvResult.text = progress }
+                    }
+                }
+                tvResult.text = result
+            } finally {
+                if (parseJob == currentCoroutineContext()[Job]) {
+                    btnCancelParse.visibility = android.view.View.GONE
+                }
+            }
         }
     }
 
     private fun parseVideo(uri: Uri) {
         parseJob?.cancel()
         tvResult.setText(R.string.processing)
+        btnCancelParse.visibility = android.view.View.VISIBLE
         parseJob = lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                decodeAndExtractVideo(uri) { current, total ->
-                    withContext(Dispatchers.Main) {
-                        tvResult.text = getString(R.string.processing_video, current, total)
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    decodeAndExtractVideo(uri) { progress ->
+                        withContext(Dispatchers.Main) { tvResult.text = progress }
                     }
                 }
+                tvResult.text = result
+            } finally {
+                // 被新任务替换后，旧任务不能修改新任务的按钮状态。
+                if (parseJob == currentCoroutineContext()[Job]) {
+                    btnCancelParse.visibility = android.view.View.GONE
+                }
             }
-            tvResult.text = result
         }
     }
 
     /** 短视频约每五秒取一帧，长视频均匀采样；找到首个通过认证的水印后停止。 */
     private suspend fun decodeAndExtractVideo(
         uri: Uri,
-        onProgress: suspend (Int, Int) -> Unit
+        onProgress: suspend (String) -> Unit
     ): String {
         val retriever = MediaMetadataRetriever()
         try {
@@ -265,9 +289,11 @@ class MainActivity : AppCompatActivity() {
             var decodedFrames = 0
             var failedFrames = 0
             var best: ScreenWatermarkCodec.Detection? = null
+            var bestScale = 1.0
+            val scaleSearch = WatermarkScaleSearch()
             for ((index, position) in positions.withIndex()) {
                 currentCoroutineContext().ensureActive()
-                onProgress(index + 1, positions.size)
+                onProgress(getString(R.string.processing_video, index + 1, positions.size))
                 val frame = try {
                     retriever.getFrameAtTime(position * 1_000, MediaMetadataRetriever.OPTION_CLOSEST)
                 } catch (e: Exception) {
@@ -278,17 +304,35 @@ class MainActivity : AppCompatActivity() {
                     failedFrames++
                     continue
                 }
-                val detection = try {
-                    currentCoroutineContext().ensureActive()
+                val result = try {
+                    val coroutine = currentCoroutineContext()
+                    coroutine.ensureActive()
                     if (frame.width.toLong() * frame.height > MAX_DECODE_PIXELS) {
                         failedFrames++
                         continue
                     }
                     decodedFrames++
-                    detectScreenWatermark(frame)
+                    var originalScale = 1.0
+                    val original = detectScreenWatermark(frame,
+                        onScale = { originalScale = it },
+                        checkCancelled = { coroutine.ensureActive() })
+                    if (original.payload != null) {
+                        WatermarkScaleSearch.Result(original, originalScale)
+                    } else {
+                        scaleSearch.detect(frame, original, originalScale,
+                            onStage = { stage ->
+                                onProgress(getString(R.string.processing_video, index + 1, positions.size) + "\n" + stage)
+                            }) { scale ->
+                            onProgress(getString(R.string.processing_video_scale,
+                                index + 1, positions.size, scale))
+                        }
+                    }
                 } finally {
                     frame.recycle()
                 }
+                val detection = result.detection
+                Log.i(LOG_TAG, "video position=${position}ms scale=${result.scale} " +
+                    "status=${detection.status} score=${detection.score}")
                 val payload = detection.payload
                 if (payload != null) {
                     return buildString {
@@ -297,6 +341,8 @@ class MainActivity : AppCompatActivity() {
                         appendLine("视频时长：${formatVideoPosition(duration)}")
                         appendLine("抽帧位置（约）：${formatVideoPosition(position)}")
                         appendLine("已解析帧数：$decodedFrames")
+                        appendLine("抽帧缩放补偿比例：${formatScale(result.scale)}")
+                        appendLine("水印格式：${detection.format}")
                         appendLine()
                         appendLine("检测到屏幕暗水印：")
                         appendLine("用户名：${payload.userId.ifEmpty { "（未填写）" }}")
@@ -309,7 +355,10 @@ class MainActivity : AppCompatActivity() {
                 val previous = best
                 if (previous == null || detection.status.ordinal > previous.status.ordinal ||
                     (detection.status == previous.status && detection.score > previous.score)
-                ) best = detection
+                ) {
+                    best = detection
+                    bestScale = result.scale
+                }
             }
             return buildString {
                 appendLine("录屏解析结果：")
@@ -329,6 +378,9 @@ class MainActivity : AppCompatActivity() {
                         else -> appendLine("抽样帧中未定位到可验证的水印。")
                     }
                     appendLine("水印同步相关强度：${formatScore(best?.score ?: 0.0)}")
+                    appendLine("最佳候选补偿比例：${formatScale(bestScale)}（未经认证）")
+                    appendLine("已尝试定位版同步信号；旧版对前 ${minOf(decodedFrames, WatermarkScaleSearch.MAX_SEARCH_FRAMES)} 帧搜索 1～2 倍等比放大，后续帧重试候选比例。")
+                    appendLine("比例搜索为有限候选搜索，不保证覆盖所有缩放或严重裁剪。")
                     appendLine("录屏压缩、缩放或裁剪可能削弱水印，建议使用原始高画质录屏。")
                     appendLine("结果仅覆盖抽样帧，不能据此判断整段视频不存在水印。")
                 }
@@ -352,6 +404,19 @@ class MainActivity : AppCompatActivity() {
         String.format(Locale.US, "%02d:%02d:%02d.%03d",
             millis / 3_600_000, millis / 60_000 % 60, millis / 1_000 % 60, millis % 1_000)
 
+    private fun formatScale(scale: Double): String = String.format(Locale.US, "%.4f", scale)
+
+    private fun detectDirectScreenWatermark(
+        bitmap: Bitmap,
+        checkCancelled: () -> Unit
+    ): ScreenWatermarkCodec.Detection {
+        checkCancelled()
+        val located = LocatedWatermarkCodec.detectDirect(bitmap, checkCancelled)
+        if (located.payload != null) return located
+        val legacy = ScreenWatermarkCodec.detectDirect(bitmap, checkCancelled)
+        return if (LocatedWatermarkCodec.better(legacy, located)) legacy else located
+    }
+
     /** 解码整图（不缩放），因为盲水印的 LSB 位置依赖原始尺寸。 */
     private fun decodeBitmap(uri: Uri): Bitmap? {
         val options = BitmapFactory.Options().apply {
@@ -363,8 +428,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 原图优先；缩放比例来自显示参数或完整截图比例，不能把裁剪尺寸当作屏幕尺寸。 */
-    private fun detectScreenWatermark(bitmap: Bitmap): ScreenWatermarkCodec.Detection {
-        var best = ScreenWatermarkCodec.detect(bitmap)
+    private fun detectScreenWatermark(
+        bitmap: Bitmap,
+        onScale: (Double) -> Unit = {},
+        checkCancelled: () -> Unit = {}
+    ): ScreenWatermarkCodec.Detection {
+        onScale(1.0)
+        var best = detectDirectScreenWatermark(bitmap, checkCancelled)
         if (best.payload != null) return best
         val metrics = resources.displayMetrics
         val mode = getSystemService(DisplayManager::class.java)
@@ -381,6 +451,7 @@ class MainActivity : AppCompatActivity() {
         if (kotlin.math.abs(sx - sy) / maxOf(sx, sy) < 0.005) scales.add(sx)
         val tried = mutableListOf<Double>()
         for (scale in scales) {
+            checkCancelled()
             if (!scale.isFinite() || scale <= 0 || kotlin.math.abs(scale - 1.0) < 0.001 ||
                 tried.any { kotlin.math.abs(it - scale) < 0.001 }) continue
             tried.add(scale)
@@ -390,18 +461,29 @@ class MainActivity : AppCompatActivity() {
             Log.i(LOG_TAG, "uniform resample ${bitmap.width}x${bitmap.height} -> ${width}x$height")
             val scaled = Bitmap.createScaledBitmap(bitmap, width, height, true)
             val result = try {
-                ScreenWatermarkCodec.detect(scaled)
+                detectDirectScreenWatermark(scaled, checkCancelled)
             } finally {
                 if (scaled !== bitmap) scaled.recycle()
             }
-            if (result.payload != null) return result
+            if (result.payload != null) {
+                onScale(scale)
+                return result
+            }
             if (result.status.ordinal > best.status.ordinal ||
-                (result.status == best.status && result.score > best.score)) best = result
+                (result.status == best.status && result.score > best.score)) {
+                best = result
+                onScale(scale)
+            }
         }
         return best
     }
-    private fun decodeAndExtract(uri: Uri): String {
+    private suspend fun decodeAndExtract(
+        uri: Uri,
+        onProgress: suspend (String) -> Unit
+    ): String {
         return try {
+            val coroutine = currentCoroutineContext()
+            coroutine.ensureActive()
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             contentResolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it, null, bounds)
@@ -417,69 +499,104 @@ class MainActivity : AppCompatActivity() {
 
             // 只解码一次，两种水印共用：屏幕暗水印（截屏）与 LSB 盲水印（图片文件）
             val bitmap = if (tooLarge) null else decodeBitmap(uri)
-            val screenDetection = bitmap?.let { detectScreenWatermark(it) }
-            val screenPayload = screenDetection?.payload
-            val lsbPayload = bitmap?.let { WatermarkCodec.extract(it) }
-            val mimeType = bounds.outMimeType.orEmpty()
-            Log.i(
-                LOG_TAG,
-                "detect ${width}x$height mime=$mimeType hit=${screenPayload != null} " +
-                    "score=${screenDetection?.score}"
-            )
-
-            buildString {
-                appendLine("解析结果：")
-                appendLine("图片尺寸：$width x $height")
-                appendLine("文件大小：${formatSize(size)}")
-                appendLine()
-                when {
-                    tooLarge ->
-                        appendLine("图片过大，已跳过水印提取（仅显示尺寸信息）。")
-
-                    screenPayload != null -> {
-                        appendLine("检测到屏幕暗水印：")
-                        appendLine("用户名：${screenPayload.userId.ifEmpty { "（未填写）" }}")
-                        appendLine("设备 ID：${screenPayload.deviceId.ifEmpty { "（未填写）" }}")
-                        appendLine("时间戳：${formatTimestamp(screenPayload.timestamp)}")
-                        appendLine("（载荷由本机 Keystore 密钥加密，仅本机可解）")
+            try {
+                coroutine.ensureActive()
+                var originalScale = 1.0
+                val original = bitmap?.let {
+                    detectScreenWatermark(it,
+                        onScale = { scale -> originalScale = scale },
+                        checkCancelled = { coroutine.ensureActive() })
+                }
+                coroutine.ensureActive()
+                // LSB 始终读取原图；已解析成功时无需再做耗时的屏幕水印比例搜索。
+                val lsbPayload = if (original?.payload == null) bitmap?.let { WatermarkCodec.extract(it) }
+                    else null
+                coroutine.ensureActive()
+                val searched = bitmap != null && original != null &&
+                    original.payload == null && lsbPayload == null
+                val screenResult = if (searched && bitmap != null && original != null) {
+                    WatermarkScaleSearch().detect(bitmap, original, originalScale,
+                        onStage = onProgress) { scale ->
+                        onProgress(getString(R.string.processing_image_scale, scale))
                     }
+                } else {
+                    original?.let { WatermarkScaleSearch.Result(it, originalScale) }
+                }
+                val screenDetection = screenResult?.detection
+                val screenPayload = screenDetection?.payload
+                val mimeType = bounds.outMimeType.orEmpty()
+                Log.i(
+                    LOG_TAG,
+                    "detect ${width}x$height mime=$mimeType hit=${screenPayload != null} " +
+                        "scale=${screenResult?.scale} status=${screenDetection?.status} " +
+                        "score=${screenDetection?.score}"
+                )
 
-                    lsbPayload != null -> {
-                        val (u, d) = parsePayload(lsbPayload)
-                        appendLine("检测到图片盲水印：")
-                        appendLine("用户名：$u")
-                        appendLine("设备 ID：$d")
-                    }
+                buildString {
+                    appendLine("解析结果：")
+                    appendLine("图片尺寸：$width x $height")
+                    appendLine("文件大小：${formatSize(size)}")
+                    appendLine()
+                    when {
+                        tooLarge ->
+                            appendLine("图片过大，已跳过水印提取（仅显示尺寸信息）。")
 
-                    else -> {
-                        when (screenDetection?.status) {
-                            ScreenWatermarkCodec.Status.INSUFFICIENT_DATA -> {
-                                appendLine("检测到疑似水印头部，但截图保留的数据不足，无法还原身份。")
-                                appendLine("头部覆盖：${screenDetection.headerBitsObserved}/32 比特")
-                                if (screenDetection.bodyBitsRequired > 0) appendLine(
-                                    "正文覆盖：${screenDetection.bodyBitsObserved}/${screenDetection.bodyBitsRequired} 比特"
-                                )
-                                appendLine("请保留更大的截图区域后重试。")
-                            }
-                            ScreenWatermarkCodec.Status.VALIDATION_FAILED -> {
-                                appendLine("检测到疑似水印头部，但载荷校验未通过。")
-                                appendLine("可能存在像素损坏、识别误差，或图片使用了其他密钥。")
-                            }
-                            else -> {
-                                appendLine("未定位到可验证的水印。")
-                                appendLine("裁剪可能移除了定位头部；请尝试保留更大的区域，并确认水印已开启。")
-                            }
+                        screenPayload != null -> {
+                            appendLine("检测到屏幕暗水印：")
+                            appendLine("用户名：${screenPayload.userId.ifEmpty { "（未填写）" }}")
+                            appendLine("设备 ID：${screenPayload.deviceId.ifEmpty { "（未填写）" }}")
+                            appendLine("时间戳：${formatTimestamp(screenPayload.timestamp)}")
+                            appendLine("图片缩放补偿比例：${formatScale(screenResult?.scale ?: originalScale)}")
+                            appendLine("水印格式：${screenDetection?.format.orEmpty()}")
+                            appendLine("（载荷由本机 Keystore 密钥加密，仅本机可解）")
                         }
-                        appendLine("水印同步相关强度：${formatScore(screenDetection?.score ?: 0.0)}")
-                        if (resampled) appendLine(
-                            "图片尺寸与当前屏幕不同，已优先按原图解析，并尝试适用的等比缩放。"
-                        )
-                        if (isLossyFormat(mimeType)) appendLine(
-                            "该图片格式可能包含有损压缩（$mimeType），建议使用 PNG 原图。"
-                        )
+
+                        lsbPayload != null -> {
+                            val (u, d) = parsePayload(lsbPayload)
+                            appendLine("检测到图片盲水印：")
+                            appendLine("用户名：$u")
+                            appendLine("设备 ID：$d")
+                        }
+
+                        else -> {
+                            when (screenDetection?.status) {
+                                ScreenWatermarkCodec.Status.INSUFFICIENT_DATA -> {
+                                    appendLine("检测到疑似水印头部，但截图保留的数据不足，无法还原身份。")
+                                    appendLine("头部覆盖：${screenDetection.headerBitsObserved}/32 比特")
+                                    if (screenDetection.bodyBitsRequired > 0) appendLine(
+                                        "正文覆盖：${screenDetection.bodyBitsObserved}/${screenDetection.bodyBitsRequired} 比特"
+                                    )
+                                    appendLine("请保留更大的截图区域后重试。")
+                                }
+                                ScreenWatermarkCodec.Status.VALIDATION_FAILED -> {
+                                    appendLine("检测到疑似水印头部，但载荷校验未通过。")
+                                    appendLine("可能存在像素损坏、识别误差，或图片使用了其他密钥。")
+                                }
+                                else -> {
+                                    appendLine("未定位到可验证的水印。")
+                                    appendLine("裁剪可能移除了定位头部；请尝试保留更大的区域，并确认水印已开启。")
+                                }
+                            }
+                            appendLine("水印同步相关强度：${formatScore(screenDetection?.score ?: 0.0)}")
+                            if (searched) {
+                                appendLine("最佳候选水印格式：${screenDetection?.format.orEmpty()}")
+                                appendLine("最佳候选补偿比例：${formatScale(screenResult?.scale ?: 1.0)}（未经认证）")
+                                appendLine("已尝试定位版同步信号和旧版 1～2 倍缩放搜索；仍可能因裁剪或信号损伤失败。")
+                            }
+                            if (resampled) appendLine(
+                                "图片尺寸与当前屏幕不同，已优先按原图解析，并尝试适用的等比缩放。"
+                            )
+                            if (isLossyFormat(mimeType)) appendLine(
+                                "该图片格式可能包含有损压缩（$mimeType），建议使用 PNG 原图。"
+                            )
+                        }
                     }
                 }
+            } finally {
+                bitmap?.recycle()
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: OutOfMemoryError) {
             "解析失败：图片过大，内存不足"
         } catch (e: Exception) {

@@ -132,14 +132,23 @@ object ScreenWatermarkCodec {
         val status: Status = if (payload != null) Status.SUCCESS else Status.NOT_FOUND,
         val headerBitsObserved: Int = 0,
         val bodyBitsObserved: Int = 0,
-        val bodyBitsRequired: Int = 0
+        val bodyBitsRequired: Int = 0,
+        val format: String = "旧版 WD"
     )
 
     /** 由截图还原载荷；无有效水印时返回 null。 */
     fun extract(bitmap: Bitmap): WatermarkPayload? = detect(bitmap).payload
 
+    /** 旧格式原尺寸、默认位置快速读取，不进入裁剪位置搜索。 */
+    fun detectDirect(bitmap: Bitmap, checkCancelled: () -> Unit = {}): Detection {
+        checkCancelled()
+        if (bitmap.width < MIN_DETECT_SIDE || bitmap.height < MIN_DETECT_SIDE) return Detection(null, 0.0)
+        return inspect(accumulate(bitmap, 0, 0, bitmap.height, 1))
+    }
+
     /** 与 [extract] 相同，但额外返回相关强度，便于区分“没画上/被压缩抹掉”与“画上了但解不出”。 */
-    fun detect(bitmap: Bitmap): Detection {
+    fun detect(bitmap: Bitmap, checkCancelled: () -> Unit = {}): Detection {
+        checkCancelled()
         if (bitmap.width < MIN_DETECT_SIDE || bitmap.height < MIN_DETECT_SIDE) {
             return Detection(null, 0.0)
         }
@@ -155,6 +164,7 @@ object ScreenWatermarkCodec {
         val coarse = ArrayList<Candidate>()
         for (py in 0 until CHIP_SIZE) {
             for (px in 0 until CHIP_SIZE) {
+                checkCancelled()
                 val acc = accumulate(bitmap, px, py, bitmap.height, 2)
                 for (cy in 0 until TILE_CHIPS) {
                     for (cx in 0 until TILE_CHIPS) {
@@ -176,6 +186,7 @@ object ScreenWatermarkCodec {
         for ((phase, positions) in offsets.groupBy { (x, y) ->
             (x % CHIP_SIZE) to (y % CHIP_SIZE)
         }) {
+            checkCancelled()
             val acc = if (phase.first == 0 && phase.second == 0) original
                 else accumulate(bitmap, phase.first, phase.second, bitmap.height, 1)
             for ((x, y) in positions) {
@@ -202,16 +213,29 @@ object ScreenWatermarkCodec {
         var sum = 0.0
         var count = 0
         var bits = 0
+        val averages = acc.averages
+        val firstColumn = Math.floorMod(-cx, TILE_CHIPS)
+        var sourceColumn = firstColumn
+        var sourceRow = Math.floorMod(-cy, TILE_CHIPS)
+        var slot = 0
         for (g in magicBits.indices) {
             var observed = false
             val sign = if (magicBits[g] == 1) 1 else -1
             for (r in 0 until HEADER_REPEAT) {
-                val slot = g * HEADER_REPEAT + r
-                val source = sourceSlot(slot, cx, cy)
+                val source = sourceRow * TILE_CHIPS + sourceColumn
                 if (acc.weight[source] > 0.0) {
-                    sum += sign * pn[slot] * acc.sum[source] / acc.weight[source]
+                    sum += sign * pn[slot] * averages[source]
                     count++
                     observed = true
+                }
+                slot++
+                if (slot % TILE_CHIPS == 0) {
+                    sourceColumn = firstColumn
+                    sourceRow++
+                    if (sourceRow == TILE_CHIPS) sourceRow = 0
+                } else {
+                    sourceColumn++
+                    if (sourceColumn == TILE_CHIPS) sourceColumn = 0
                 }
             }
             if (observed) bits++
@@ -289,6 +313,10 @@ object ScreenWatermarkCodec {
     private class Accumulator {
         val sum = DoubleArray(TILE_SLOTS)
         val weight = DoubleArray(TILE_SLOTS)
+        // 累加完成后才访问；多比例定位时避免对每一个候选平移重复做除法。
+        val averages: DoubleArray by lazy {
+            DoubleArray(TILE_SLOTS) { if (weight[it] > 0.0) sum[it] / weight[it] else 0.0 }
+        }
     }
 
     /**

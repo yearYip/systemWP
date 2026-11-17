@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="processing_image_scale">正在解析图片，搜索补偿比例 %1$.4f…</string>
     <string name="app_name">隐形水印</string>
     <string name="title">屏幕隐形水印</string>
     <string name="label_username">用户名</string>
@@ -12,6 +13,9 @@
     <string name="pick_image">选择图片进行解析</string>
     <string name="pick_video">录屏水印解析</string>
     <string name="processing_video">正在解析录屏：%1$d / %2$d 帧</string>
+    <string name="processing_video_scale">正在解析录屏：%1$d / %2$d 帧\n搜索缩放补偿比例：%3$.4f\n首次搜索可能较慢，可点击取消解析</string>
+    <string name="cancel_parse">取消解析</string>
+    <string name="parse_cancelled">已取消解析</string>
     <string name="processing">处理中…</string>
     <string name="grant_overlay">请先在系统设置中授予“显示在其他应用上层”权限</string>
     <string name="watermark_running">屏幕水印运行中</string>

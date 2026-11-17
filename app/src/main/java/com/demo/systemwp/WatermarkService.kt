@@ -141,9 +141,8 @@ class WatermarkService : Service() {
     }
 
     /**
-     * 全屏隐形暗水印：由 [ScreenWatermarkCodec] 生成的 4×4 棋盘纹理平铺而成。
-     * 幅度约 [ScreenWatermarkCodec.OVERLAY_ALPHA] 个灰阶且小块内局部均值为零，
-     * 正常观看距离下不可见，但屏幕像素里真实存在，截屏后可被本应用相关检测还原。
+     * 全屏暗水印：由 [LocatedWatermarkCodec] 生成正文棋盘及分散的双频定位信号。
+     * 继续复用低透明度 shader 平铺，不在每个显示帧执行编码或定位计算。
      *
      * 用户名/设备 ID 变化时在下一帧重建 tile；身份未变时每分钟更新时间戳。
      */
@@ -214,6 +213,7 @@ class WatermarkService : Service() {
 
         private fun build(userId: String, deviceId: String): BitmapShader? {
             return try {
+                val startedAt = SystemClock.elapsedRealtime()
                 val payload = WatermarkPayload(userId, deviceId, System.currentTimeMillis())
                 val plain = payload.encode()
                 val sealed = WatermarkCrypto.seal(plain)
@@ -221,12 +221,13 @@ class WatermarkService : Service() {
                     Log.w(TAG, "tile skipped: Keystore seal failed")
                     return null
                 }
-                val tile = ScreenWatermarkCodec.buildTile(sealed)
+                val tile = LocatedWatermarkCodec.buildTile(sealed)
                 if (tile == null) {
                     Log.w(TAG, "tile skipped: buildTile failed, sealed=${sealed.size}B")
                     return null
                 }
-                Log.i(TAG, "tile ready: plain=${plain.size}B sealed=${sealed.size}B")
+                Log.i(TAG, "tile ready: format=W2 plain=${plain.size}B sealed=${sealed.size}B " +
+                    "buildMs=${SystemClock.elapsedRealtime() - startedAt}")
                 ScreenWatermarkCodec.createShader(tile)
             } catch (e: Exception) {
                 Log.w(TAG, "tile build failed", e)
