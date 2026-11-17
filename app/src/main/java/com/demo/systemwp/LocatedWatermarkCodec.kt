@@ -30,7 +30,8 @@ object LocatedWatermarkCodec {
         val headerBitsObserved: Int = 0,
         val bodyBitsObserved: Int = 0,
         val bodyBitsRequired: Int = 0,
-        val format: String = "定位版 W2"
+        val format: String = "定位版 W2",
+        val horizontalMirrored: Boolean = false
     )
 
     fun createShader(tile: Bitmap): BitmapShader =
@@ -83,6 +84,15 @@ object LocatedWatermarkCodec {
     fun detectDirect(bitmap: Bitmap, checkCancelled: () -> Unit): Detection =
         Image(bitmap).inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
 
+    /** 屏幕尺寸补偿的直接读取：共用像素缓存，两个方向均须认证。 */
+    fun detectDirectWithMirror(bitmap: Bitmap, checkCancelled: () -> Unit): Detection {
+        val image = Image(bitmap)
+        val normal = image.inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
+        if (normal.payload != null) return normal
+        val mirrored = image.mirrored().inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
+        return if (better(mirrored, normal)) mirrored else normal
+    }
+
     suspend fun detectLocated(
         bitmap: Bitmap,
         checkCancelled: () -> Unit,
@@ -97,9 +107,45 @@ object LocatedWatermarkCodec {
             diagnostic("complete reason=image_too_small minimumSide=96")
             return null
         }
-        val image = Image(bitmap)
-        onProgress("正在快速检测原尺寸水印头部…")
-        val probe = image.probeUnscaled(checkCancelled, ::diagnostic)
+        val normalImage = Image(bitmap)
+        data class Direction(val image: Image, val probe: Image.UnscaledProbe, val label: String)
+        val directions = listOf(normalImage to "正向", normalImage.mirrored() to "水平镜像补偿").map { (image, label) ->
+            checkCancelled()
+            onProgress("正在预检方向：$label")
+            val probe = image.probeUnscaled(checkCancelled) { diagnostic("direction=$label $it") }
+            Direction(image, probe, label)
+        }.sortedWith(compareByDescending<Direction> { it.probe.strong }.thenByDescending { it.probe.confidence })
+        diagnostic("orientation order=${directions.joinToString { it.label }} " +
+            "confidence=${directions.joinToString { "${it.label}:${it.probe.confidence}" }}")
+        var best: WatermarkScaleSearch.Result? = null
+        for ((index, direction) in directions.withIndex()) {
+            checkCancelled()
+            diagnostic("orientation attempt=${index + 1}/2 direction=${direction.label}")
+            val result = detectDirection(direction.image, direction.probe, checkCancelled,
+                onProgress = { progress ->
+                    onProgress("解析方向：${direction.label}（${index + 1} / 2）\n$progress")
+                }, diagnostic = { diagnostic("direction=${direction.label} $it") })
+            if (result != null) {
+                val previous = best
+                if (previous == null || better(result.detection, previous.detection)) best = result
+                if (result.detection.payload != null) {
+                    diagnostic("orientation complete reason=success horizontalMirrored=${result.detection.horizontalMirrored}")
+                    return result
+                }
+            }
+            diagnostic("orientation fallback reason=not_authenticated direction=${direction.label}")
+        }
+        diagnostic("orientation complete reason=no_authenticated_direction")
+        return best
+    }
+
+    private suspend fun detectDirection(
+        image: Image,
+        probe: Image.UnscaledProbe,
+        checkCancelled: () -> Unit,
+        onProgress: suspend (String) -> Unit,
+        diagnostic: (String) -> Unit
+    ): WatermarkScaleSearch.Result? {
         var best: WatermarkScaleSearch.Result? = null
         var unscaledTried = false
 
@@ -108,14 +154,14 @@ object LocatedWatermarkCodec {
             unscaledTried = true
             onProgress("正在验证原尺寸水印…")
             // 优先完成预检找到的位置，认证失败才进入完整的原尺度位置搜索。
-            val seeded = image.completeUnscaledProbe(probe, checkCancelled, ::diagnostic)
+            val seeded = image.completeUnscaledProbe(probe, checkCancelled, diagnostic)
             if (seeded != null) {
                 val result = WatermarkScaleSearch.Result(seeded, 1.0)
                 val previous = best
                 if (previous == null || better(seeded, previous.detection)) best = result
                 if (seeded.payload != null) return result
             }
-            val detection = image.detectUnscaled(checkCancelled, onProgress, ::diagnostic)
+            val detection = image.detectUnscaled(checkCancelled, onProgress, diagnostic)
             if (detection != null) {
                 val result = WatermarkScaleSearch.Result(detection, 1.0)
                 val previous = best
@@ -132,7 +178,7 @@ object LocatedWatermarkCodec {
         }
         onProgress("正在搜索水印定位信号…")
         val projections = image.projections(checkCancelled)
-        val candidates = WatermarkLocator.locateJoint(projections.first, projections.second, checkCancelled, ::diagnostic)
+        val candidates = WatermarkLocator.locateJoint(projections.first, projections.second, checkCancelled, diagnostic)
         if (!unscaledTried) {
             val clearScaledSignal = candidates.any {
                 abs(it.x.scale - 1.0) >= 0.01 && it.score >= 0.3 && minOf(it.x.score, it.y.score) >= 0.15
@@ -162,8 +208,8 @@ object LocatedWatermarkCodec {
                 "scoreX=${x.score} scoreY=${y.score} jointScore=${candidate.score}"
             onProgress("正在处理候选 ${index + 1} / ${candidates.size}：对齐并验证…")
             val scale = (x.scale + y.scale) / 2.0
-            Log.i("SystemWP", "locator sx=${x.scale} sy=${y.scale} " +
-                "x=${x.offset} y=${y.offset} scoreX=${x.score} scoreY=${y.score} run=$runId")
+            diagnostic("geometry sx=${x.scale} sy=${y.scale} " +
+                "x=${x.offset} y=${y.offset} scoreX=${x.score} scoreY=${y.score}")
             val calibrated = image.calibrateHeader(scale, checkCancelled,
                 onProgress = { progress ->
                     onProgress("正在处理候选 ${index + 1} / ${candidates.size}\n$progress")
@@ -206,10 +252,19 @@ object LocatedWatermarkCodec {
     private val coarseMagicIndices = IntArray(64) { it / 16 * 64 + it % 16 }
     private val isMagicSlot = BooleanArray(SLOTS).also { mask -> magicSlots.forEach { mask[it] = true } }
 
-    private class Image(bitmap: Bitmap) {
-        val width = bitmap.width
-        val height = bitmap.height
-        val pixels = IntArray(width * height).also { bitmap.getPixels(it, 0, width, 0, 0, width, height) }
+    private class Image private constructor(
+        val width: Int,
+        val height: Int,
+        val pixels: IntArray,
+        val horizontalMirrored: Boolean
+    ) {
+        constructor(bitmap: Bitmap) : this(bitmap.width, bitmap.height,
+            IntArray(bitmap.width * bitmap.height).also {
+                bitmap.getPixels(it, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+            }, false)
+
+        // 两个方向只共享不可变像素；相位缓存独立，避免混用方向不同的采样。
+        fun mirrored(): Image = Image(width, height, pixels, !horizontalMirrored)
 
         private data class CropCandidate(val phaseX: Int, val phaseY: Int, val chipX: Int, val chipY: Int,
                                          val score: Double, val samples: Samples)
@@ -217,7 +272,7 @@ object LocatedWatermarkCodec {
         data class Geometry(val scale: Double, val x: Double, val y: Double, val score: Double)
         private data class HeaderEvidence(val score: Double, val matchingBits: Int, val observedSlots: Int,
                                           val coherence: Double)
-        data class UnscaledProbe(val positions: List<Geometry>, val strong: Boolean)
+        data class UnscaledProbe(val positions: List<Geometry>, val strong: Boolean, val confidence: Double)
         // 预检与完整原尺度搜索共用采样，避免再次读取同一像素相位。
         private val unscaledPhaseSamples = arrayOfNulls<Samples>(CHIP * CHIP)
 
@@ -228,11 +283,14 @@ object LocatedWatermarkCodec {
             val strongest = measured.firstOrNull()?.second
             val strong = strongest != null && strongest.score >= 0.3 && strongest.matchingBits >= 14 &&
                 strongest.observedSlots >= 128 && strongest.coherence >= 0.25
+            val confidence = max(0.0, strongest?.score ?: 0.0) *
+                max(0.0, strongest?.coherence ?: 0.0) * ((strongest?.matchingBits ?: 0) / 16.0)
             diagnostic("probe scale=1.0 phases=36 coarseMagicSlots=64 positions=${positions.size} " +
                 "score=${strongest?.score} magicMatches=${strongest?.matchingBits}/16 " +
-                "magicSlots=${strongest?.observedSlots}/256 coherence=${strongest?.coherence} strong=$strong")
+                "magicSlots=${strongest?.observedSlots}/256 coherence=${strongest?.coherence} " +
+                "strong=$strong confidence=$confidence")
             // 只检查已知 magic，不读取长度、正文，也不在预检阶段执行认证。
-            return UnscaledProbe(measured.map { (geometry, evidence) -> geometry.copy(score = evidence.score) }, strong)
+            return UnscaledProbe(measured.map { (geometry, evidence) -> geometry.copy(score = evidence.score) }, strong, confidence)
         }
 
         fun completeUnscaledProbe(probe: UnscaledProbe, checkCancelled: () -> Unit,
@@ -487,7 +545,8 @@ object LocatedWatermarkCodec {
             for (row in 0 until height) {
                 if (row % 32 == 0) checkCancelled()
                 for (column in 0 until width) {
-                    val pixel = pixels[row * width + column]
+                    val sourceColumn = if (horizontalMirrored) width - 1 - column else column
+                    val pixel = pixels[row * width + sourceColumn]
                     val g = (pixel ushr 8) and 255
                     x[column] += ((pixel ushr 16) and 255) - g
                     y[row] += (pixel and 255) - g
@@ -503,7 +562,10 @@ object LocatedWatermarkCodec {
             val iy = floor(y).toInt()
             val fx = x - ix
             val fy = y - iy
-            fun at(dx: Int, dy: Int): Double = ((pixels[(iy + dy) * width + ix + dx] ushr 8) and 255).toDouble()
+            fun at(dx: Int, dy: Int): Double {
+                val column = if (horizontalMirrored) width - 1 - (ix + dx) else ix + dx
+                return ((pixels[(iy + dy) * width + column] ushr 8) and 255).toDouble()
+            }
             return (at(0, 0) * (1 - fx) + at(1, 0) * fx) * (1 - fy) +
                 (at(0, 1) * (1 - fx) + at(1, 1) * fx) * fy
         }
@@ -570,7 +632,7 @@ object LocatedWatermarkCodec {
             } / 16.0
             fun result(status: Status, observed: Int = 0, required: Int = 0,
                        payload: WatermarkPayload? = null) = Detection(
-                payload, max(0.0, score), status, observedHeader, observed, required, FORMAT)
+                payload, max(0.0, score), status, observedHeader, observed, required, FORMAT, horizontalMirrored)
             val header = WatermarkBits.bitsToBytes(IntArray(HEADER_BITS) { if ((headerValues[it] ?: 0.0) > 0) 1 else 0 })
             if ((header[0].toInt() and 255) != (MAGIC ushr 8) ||
                 (header[1].toInt() and 255) != (MAGIC and 255)) return result(Status.NOT_FOUND)
