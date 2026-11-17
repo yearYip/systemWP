@@ -35,6 +35,13 @@ class WatermarkService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification())
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        // TODO(system-watermark)：此处预留系统水印接口的连接/创建入口。
+        // 以下仅为伪代码，接口、方法名及传输格式须以系统方提供的协议为准：
+        // systemWatermarkSession = systemWatermarkApi.open(displayId)
+        // 系统侧按显示器管理全屏层；覆盖锁屏、不接收输入、捕获画面包含水印等由系统保证。
+        // 正式接入时选择系统层或现有悬浮窗，避免两者同时显示导致水印重复叠加。
+        // 若不再创建 WatermarkView，需将其每分钟刷新及身份变化处理迁到 Service，
+        // 不能继续依赖 View 的 onDraw/onAttachedToWindow 触发生成和提交。
         addOverlay()
         observeIdentityChanges()
     }
@@ -48,6 +55,9 @@ class WatermarkService : Service() {
             WatermarkPrefs.prefs(this).unregisterOnSharedPreferenceChangeListener(it)
         }
         prefsListener = null
+        // TODO(system-watermark)：停止水印时隐藏/释放系统侧会话（伪代码）：
+        // systemWatermarkSession?.close()
+        // 多屏会话均需释放；服务断连后的恢复策略与资源归属须按系统协议实现。
         removeOverlay()
         super.onDestroy()
     }
@@ -126,7 +136,8 @@ class WatermarkService : Service() {
     }
 
     /**
-     * 优先使用系统窗口类型（platform 签名 + priv-app 才生效），
+     * 优先尝试系统窗口类型，以实际获授的 INTERNAL_SYSTEM_WINDOW 权限为准；
+     * 仅放入 priv-app 不保证取得该权限。
      * 否则降级为普通悬浮窗，保证普通安装也能运行。
      */
     private fun windowType(): Int {
@@ -180,6 +191,8 @@ class WatermarkService : Service() {
             super.onDraw(canvas)
             val current = currentShader() ?: return
             paint.alpha = currentAlpha()
+            // TODO(system-watermark)：调试透明度变化时也要更新系统层，不应等待下一分钟。
+            // systemWatermarkSession.setAlpha(currentAlpha()) // 伪代码；按变化更新，避免逐帧调用。
             paint.shader = current
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
         }
@@ -226,6 +239,13 @@ class WatermarkService : Service() {
                     Log.w(TAG, "tile skipped: buildTile failed, sealed=${sealed.size}B")
                     return null
                 }
+                // TODO(system-watermark)：W2 纹理已生成，在这里预留提交位置（伪代码）：
+                // systemWatermarkSession.submit(tile, alpha = currentAlpha(),
+                //     repeat = true, originX = 0, originY = 0)
+                // 传递原始 672×672 纹理，按目标显示器像素 1:1 平铺；透明度只应用一次。
+                // Bitmap/Surface/共享缓冲区等传输形式待定；异步提交完成前不得提前回收纹理。
+                // 提交成功才更新系统侧状态；失败如何重试或回落到悬浮窗需显式约定。
+                // 系统服务重连、显示器新增或配置变化后，需为相应会话重新提交有效纹理。
                 Log.i(TAG, "tile ready: format=W2 plain=${plain.size}B sealed=${sealed.size}B " +
                     "buildMs=${SystemClock.elapsedRealtime() - startedAt}")
                 LocatedWatermarkCodec.createShader(tile)
@@ -242,9 +262,9 @@ class WatermarkService : Service() {
         private const val REFRESH_INTERVAL_MS = 60_000L
 
         /**
-         * WindowManager.LayoutParams.TYPE_INTERNAL_SYSTEM_WINDOW 的数值。
-         * 该常量在 SDK 中是 @hide，只能以字面量引用；
-         * 未持有 INTERNAL_SYSTEM_WINDOW 权限时添加窗口会抛 BadTokenException。
+         * 历史变量名保留：2021 在 AOSP 中实际对应隐藏类型 TYPE_BOOT_PROGRESS，
+         * 不是名为 TYPE_INTERNAL_SYSTEM_WINDOW 的 SDK 窗口类型。
+         * INTERNAL_SYSTEM_WINDOW 是权限名称；后续系统专用水印接口不应依赖该历史类型。
          */
         private const val TYPE_INTERNAL_SYSTEM_WINDOW = 2021
     }
