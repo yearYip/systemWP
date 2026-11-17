@@ -312,16 +312,17 @@ class MainActivity : AppCompatActivity() {
                         continue
                     }
                     decodedFrames++
-                    var originalScale = 1.0
-                    val original = detectScreenWatermark(frame,
-                        onScale = { originalScale = it },
-                        checkCancelled = { coroutine.ensureActive() })
+                    val originalScale = 1.0
+                    val original = detectDirectScreenWatermark(frame) { coroutine.ensureActive() }
                     if (original.payload != null) {
                         WatermarkScaleSearch.Result(original, originalScale)
                     } else {
                         scaleSearch.detect(frame, original, originalScale,
                             onStage = { stage ->
                                 onProgress(getString(R.string.processing_video, index + 1, positions.size) + "\n" + stage)
+                            },
+                            knownScaleFallback = {
+                                detectScreenSizeCompensation(frame, original) { coroutine.ensureActive() }
                             }) { scale ->
                             onProgress(getString(R.string.processing_video_scale,
                                 index + 1, positions.size, scale))
@@ -427,15 +428,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 原图优先；缩放比例来自显示参数或完整截图比例，不能把裁剪尺寸当作屏幕尺寸。 */
-    private fun detectScreenWatermark(
+    /** 在原尺度/未知尺度两条路径均未认证后，保留设备显示尺寸补偿作为兼容路径。 */
+    private fun detectScreenSizeCompensation(
         bitmap: Bitmap,
-        onScale: (Double) -> Unit = {},
+        original: ScreenWatermarkCodec.Detection,
         checkCancelled: () -> Unit = {}
-    ): ScreenWatermarkCodec.Detection {
-        onScale(1.0)
-        var best = detectDirectScreenWatermark(bitmap, checkCancelled)
-        if (best.payload != null) return best
+    ): WatermarkScaleSearch.Result {
+        var best = original
+        var bestScale = 1.0
+        if (best.payload != null) return WatermarkScaleSearch.Result(best, bestScale)
         val metrics = resources.displayMetrics
         val mode = getSystemService(DisplayManager::class.java)
             ?.getDisplay(Display.DEFAULT_DISPLAY)?.mode
@@ -466,16 +467,15 @@ class MainActivity : AppCompatActivity() {
                 if (scaled !== bitmap) scaled.recycle()
             }
             if (result.payload != null) {
-                onScale(scale)
-                return result
+                return WatermarkScaleSearch.Result(result, scale)
             }
             if (result.status.ordinal > best.status.ordinal ||
                 (result.status == best.status && result.score > best.score)) {
                 best = result
-                onScale(scale)
+                bestScale = scale
             }
         }
-        return best
+        return WatermarkScaleSearch.Result(best, bestScale)
     }
     private suspend fun decodeAndExtract(
         uri: Uri,
@@ -501,11 +501,9 @@ class MainActivity : AppCompatActivity() {
             val bitmap = if (tooLarge) null else decodeBitmap(uri)
             try {
                 coroutine.ensureActive()
-                var originalScale = 1.0
+                val originalScale = 1.0
                 val original = bitmap?.let {
-                    detectScreenWatermark(it,
-                        onScale = { scale -> originalScale = scale },
-                        checkCancelled = { coroutine.ensureActive() })
+                    detectDirectScreenWatermark(it) { coroutine.ensureActive() }
                 }
                 coroutine.ensureActive()
                 // LSB 始终读取原图；已解析成功时无需再做耗时的屏幕水印比例搜索。
@@ -516,7 +514,10 @@ class MainActivity : AppCompatActivity() {
                     original.payload == null && lsbPayload == null
                 val screenResult = if (searched && bitmap != null && original != null) {
                     WatermarkScaleSearch().detect(bitmap, original, originalScale,
-                        onStage = onProgress) { scale ->
+                        onStage = onProgress,
+                        knownScaleFallback = {
+                            detectScreenSizeCompensation(bitmap, original) { coroutine.ensureActive() }
+                        }) { scale ->
                         onProgress(getString(R.string.processing_image_scale, scale))
                     }
                 } else {

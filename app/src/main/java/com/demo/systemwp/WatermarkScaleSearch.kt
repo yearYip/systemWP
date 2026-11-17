@@ -25,6 +25,7 @@ class WatermarkScaleSearch {
         original: ScreenWatermarkCodec.Detection,
         originalScale: Double = 1.0,
         onStage: suspend (String) -> Unit = {},
+        knownScaleFallback: (suspend () -> Result)? = null,
         onProgress: suspend (Double) -> Unit
     ): Result {
         var best = Result(original, originalScale)
@@ -38,6 +39,12 @@ class WatermarkScaleSearch {
         if (located != null) {
             if (located.detection.payload != null) return located
             if (LocatedWatermarkCodec.better(located.detection, best.detection)) best = located
+        }
+        if (knownScaleFallback != null) {
+            onStage("正在尝试屏幕尺寸补偿…")
+            val compensated = knownScaleFallback()
+            if (compensated.detection.payload != null) return compensated
+            if (LocatedWatermarkCodec.better(compensated.detection, best.detection)) best = compensated
         }
         onStage("定位版未通过认证，正在尝试兼容旧版水印…")
         val legacy = ScreenWatermarkCodec.detect(bitmap) { coroutine.ensureActive() }

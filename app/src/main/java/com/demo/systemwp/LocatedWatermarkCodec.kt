@@ -77,25 +77,76 @@ object LocatedWatermarkCodec {
             return null
         }
         val image = Image(bitmap)
-        // 纯裁剪不应依赖彩色背景中的定位频谱：固定 1.0，以已知头部搜索所有整像素位置。
-        onProgress("正在按原尺寸搜索裁剪位置…")
-        val unscaled = image.detectUnscaled(checkCancelled, onProgress, ::diagnostic)
-        var best = unscaled?.let { WatermarkScaleSearch.Result(it, 1.0) }
-        if (unscaled?.payload != null) return best
+        onProgress("正在快速检测原尺寸水印头部…")
+        val probe = image.probeUnscaled(checkCancelled, ::diagnostic)
+        var best: WatermarkScaleSearch.Result? = null
+        var unscaledTried = false
+
+        suspend fun tryUnscaled(): WatermarkScaleSearch.Result? {
+            checkCancelled()
+            unscaledTried = true
+            onProgress("正在验证原尺寸水印…")
+            // 优先完成预检找到的位置，认证失败才进入完整的原尺度位置搜索。
+            val seeded = image.completeUnscaledProbe(probe, checkCancelled, ::diagnostic)
+            if (seeded != null) {
+                val result = WatermarkScaleSearch.Result(seeded, 1.0)
+                val previous = best
+                if (previous == null || better(seeded, previous.detection)) best = result
+                if (seeded.payload != null) return result
+            }
+            val detection = image.detectUnscaled(checkCancelled, onProgress, ::diagnostic)
+            if (detection != null) {
+                val result = WatermarkScaleSearch.Result(detection, 1.0)
+                val previous = best
+                if (previous == null || better(detection, previous.detection)) best = result
+                if (detection.payload != null) return result
+            }
+            return null
+        }
+
+        if (probe.strong) {
+            diagnostic("route first=unscaled reason=strong_unscaled_header")
+            tryUnscaled()?.let { return it }
+            diagnostic("route fallback=scaled reason=unscaled_not_authenticated")
+        }
         onProgress("正在搜索水印定位信号…")
         val projections = image.projections(checkCancelled)
         val candidates = WatermarkLocator.locateJoint(projections.first, projections.second, checkCancelled, ::diagnostic)
+        if (!unscaledTried) {
+            val clearScaledSignal = candidates.any {
+                abs(it.x.scale - 1.0) >= 0.01 && it.score >= 0.3 && minOf(it.x.score, it.y.score) >= 0.15
+            }
+            // 仅用相关运算数估计相对成本，不把它当作设备上的实际耗时。
+            val unscaledCost = 144L * SLOTS * magicSlots.size
+            val scaledCost = if (candidates.isEmpty()) Long.MAX_VALUE
+                else candidates.size * 9L * 36 * SLOTS * coarseMagicIndices.size
+            val scaledFirst = clearScaledSignal || scaledCost < unscaledCost
+            val reason = when {
+                clearScaledSignal -> "strong_scaled_pilot"
+                scaledFirst -> "ambiguous_lower_scaled_cost"
+                else -> "ambiguous_lower_unscaled_cost"
+            }
+            diagnostic("route first=${if (scaledFirst) "scaled" else "unscaled"} reason=$reason " +
+                "unscaledCorrelationOps=$unscaledCost scaledCorrelationOps=$scaledCost")
+            if (!scaledFirst) {
+                tryUnscaled()?.let { return it }
+                diagnostic("route fallback=scaled reason=unscaled_not_authenticated")
+            }
+        }
         for ((index, candidate) in candidates.withIndex()) {
             checkCancelled()
             val x = candidate.x
             val y = candidate.y
             val pairDetails = "joint candidate=${index + 1} scale=${x.scale} " +
                 "scoreX=${x.score} scoreY=${y.score} jointScore=${candidate.score}"
-            onProgress("已找到候选定位信号，正在对齐并验证…")
+            onProgress("正在处理候选 ${index + 1} / ${candidates.size}：对齐并验证…")
             val scale = (x.scale + y.scale) / 2.0
             Log.i("SystemWP", "locator sx=${x.scale} sy=${y.scale} " +
                 "x=${x.offset} y=${y.offset} scoreX=${x.score} scoreY=${y.score} run=$runId")
-            val calibrated = image.calibrateHeader(scale, checkCancelled, onProgress) {
+            val calibrated = image.calibrateHeader(scale, checkCancelled,
+                onProgress = { progress ->
+                    onProgress("正在处理候选 ${index + 1} / ${candidates.size}\n$progress")
+                }) {
                 diagnostic("candidate=${index + 1} $it")
             }
             if (calibrated != null) {
@@ -107,6 +158,10 @@ object LocatedWatermarkCodec {
                     return calibrated
                 }
             }
+        }
+        if (!unscaledTried) {
+            diagnostic("route fallback=unscaled reason=scaled_not_authenticated")
+            tryUnscaled()?.let { return it }
         }
         val reason = if (candidates.isEmpty()) "no_joint_scale_candidates" else "all_decode_attempts_failed"
         diagnostic("complete reason=$reason jointCandidates=${candidates.size} " +
@@ -138,8 +193,45 @@ object LocatedWatermarkCodec {
         private data class CropCandidate(val phaseX: Int, val phaseY: Int, val chipX: Int, val chipY: Int,
                                          val score: Double, val samples: Samples)
 
-        private data class Geometry(val scale: Double, val x: Double, val y: Double, val score: Double)
-        private data class HeaderEvidence(val score: Double, val matchingBits: Int, val observedSlots: Int)
+        data class Geometry(val scale: Double, val x: Double, val y: Double, val score: Double)
+        private data class HeaderEvidence(val score: Double, val matchingBits: Int, val observedSlots: Int,
+                                          val coherence: Double)
+        data class UnscaledProbe(val positions: List<Geometry>, val strong: Boolean)
+        // 预检与完整原尺度搜索共用采样，避免再次读取同一像素相位。
+        private val unscaledPhaseSamples = arrayOfNulls<Samples>(CHIP * CHIP)
+
+        fun probeUnscaled(checkCancelled: () -> Unit, diagnostic: (String) -> Unit): UnscaledProbe {
+            val positions = searchHeaderPositions(1.0, checkCancelled)
+            val measured = positions.map { it to headerEvidence(it, checkCancelled) }
+                .sortedByDescending { it.second.score }
+            val strongest = measured.firstOrNull()?.second
+            val strong = strongest != null && strongest.score >= 0.3 && strongest.matchingBits >= 14 &&
+                strongest.observedSlots >= 128 && strongest.coherence >= 0.25
+            diagnostic("probe scale=1.0 phases=36 coarseMagicSlots=64 positions=${positions.size} " +
+                "score=${strongest?.score} magicMatches=${strongest?.matchingBits}/16 " +
+                "magicSlots=${strongest?.observedSlots}/256 coherence=${strongest?.coherence} strong=$strong")
+            // 只检查已知 magic，不读取长度、正文，也不在预检阶段执行认证。
+            return UnscaledProbe(measured.map { (geometry, evidence) -> geometry.copy(score = evidence.score) }, strong)
+        }
+
+        fun completeUnscaledProbe(probe: UnscaledProbe, checkCancelled: () -> Unit,
+                                  diagnostic: (String) -> Unit): ScreenWatermarkCodec.Detection? {
+            var best: ScreenWatermarkCodec.Detection? = null
+            for ((index, position) in probe.positions.withIndex()) {
+                checkCancelled()
+                val geometry = refineHeader(position, checkCancelled, adjustScale = false)
+                val detection = inspect(1.0, 1.0, geometry.x, geometry.y, checkCancelled)
+                diagnostic("unscaled probeCandidate=${index + 1} scale=1.0 offsetX=${geometry.x} " +
+                    "offsetY=${geometry.y} status=${detection.status} score=${detection.score}")
+                val previous = best
+                if (previous == null || better(detection, previous)) best = detection
+                if (detection.payload != null) {
+                    diagnostic("complete reason=success stage=unscaled source=probe scale=1.0")
+                    return detection
+                }
+            }
+            return best
+        }
 
         /** 频谱只提供尺度初值；位置及最终尺度由已知 magic 的真实 G 通道信号校准。
          * 整数恢复宽度保留相邻值，连续采样避免再次缩放 bitmap 引入插值。
@@ -195,7 +287,11 @@ object LocatedWatermarkCodec {
             val strongest = ArrayList<Geometry>()
             for (py in 0 until CHIP step 2) for (px in 0 until CHIP step 2) {
                 checkCancelled()
-                val samples = sample(scale, scale, px.toDouble(), py.toDouble(), checkCancelled)
+                val samples = if (scale == 1.0) {
+                    val key = py * CHIP + px
+                    unscaledPhaseSamples[key] ?: sample(scale, scale, px.toDouble(), py.toDouble(), checkCancelled)
+                        .also { unscaledPhaseSamples[key] = it }
+                } else sample(scale, scale, px.toDouble(), py.toDouble(), checkCancelled)
                 val averages = DoubleArray(SLOTS) {
                     if (samples.weights[it] > 0) samples.sums[it] / samples.weights[it] else 0.0
                 }
@@ -246,21 +342,25 @@ object LocatedWatermarkCodec {
             val samples = sample(geometry.scale, geometry.scale, geometry.x, geometry.y, checkCancelled, magicOnly = true)
             val bitSums = DoubleArray(16)
             var sum = 0.0
+            var magnitude = 0.0
             var count = 0
             for (i in magicSlots.indices) {
                 val slot = magicSlots[i]
                 if (samples.weights[slot] > 0) {
                     val value = magicSigns[i] * samples.sums[slot] / samples.weights[slot]
                     sum += value
+                    magnitude += abs(value)
                     bitSums[i % 16] += value
                     count++
                 }
             }
             val score = if (count < 64) 0.0 else sum / count * kotlin.math.sqrt(count / 256.0)
-            return HeaderEvidence(score, bitSums.count { it > 0 }, count)
+            return HeaderEvidence(score, bitSums.count { it > 0 }, count,
+                if (magnitude > 0) sum / magnitude else 0.0)
         }
 
-        private fun refineHeader(initial: Geometry, checkCancelled: () -> Unit): Geometry {
+        private fun refineHeader(initial: Geometry, checkCancelled: () -> Unit,
+                                 adjustScale: Boolean = true): Geometry {
             var best = initial.copy(score = headerEvidence(initial, checkCancelled).score)
             // 位置与比例交替优化。改变比例时保持图像中心的水印坐标，减少两者的耦合。
             for (step in doubleArrayOf(1.0, 0.5, 0.25)) {
@@ -273,7 +373,7 @@ object LocatedWatermarkCodec {
                         if (score > best.score) best = candidate.copy(score = score)
                     }
                     val scaleCenter = best
-                    for (direction in intArrayOf(-1, 1)) {
+                    for (direction in if (adjustScale) intArrayOf(-1, 1) else intArrayOf()) {
                         val delta = direction * step / (2.0 * width)
                         val scale = scaleCenter.scale + delta
                         if (scale !in 0.45..1.10) continue
@@ -298,7 +398,8 @@ object LocatedWatermarkCodec {
                 onProgress("正在按原尺寸搜索裁剪位置：${py + 1} / $CHIP")
                 for (px in 0 until CHIP) {
                     checkCancelled()
-                    val samples = sample(1.0, 1.0, px.toDouble(), py.toDouble(), checkCancelled)
+                    val samples = unscaledPhaseSamples[py * CHIP + px] ?:
+                        sample(1.0, 1.0, px.toDouble(), py.toDouble(), checkCancelled)
                     val averages = DoubleArray(SLOTS) {
                         if (samples.weights[it] > 0) samples.sums[it] / samples.weights[it] else 0.0
                     }
