@@ -190,7 +190,7 @@ class MainActivity : AppCompatActivity() {
         prefs.edit()
             .putInt(
                 WatermarkPrefs.KEY_DEBUG_ALPHA,
-                if (makeVisible) ScreenWatermarkCodec.DEBUG_OVERLAY_ALPHA else 0
+                if (makeVisible) LocatedWatermarkCodec.DEBUG_OVERLAY_ALPHA else 0
             )
             .apply()
         if (isEnabled() && Settings.canDrawOverlays(this)) startWatermark()
@@ -324,7 +324,7 @@ class MainActivity : AppCompatActivity() {
             }.distinct()
             var decodedFrames = 0
             var failedFrames = 0
-            var best: ScreenWatermarkCodec.Detection? = null
+            var best: LocatedWatermarkCodec.Detection? = null
             var bestScale = 1.0
             val scaleSearch = WatermarkScaleSearch()
             for ((index, position) in positions.withIndex()) {
@@ -359,10 +359,7 @@ class MainActivity : AppCompatActivity() {
                             },
                             knownScaleFallback = {
                                 detectScreenSizeCompensation(frame, original) { coroutine.ensureActive() }
-                            }) { scale ->
-                            onProgress(getString(R.string.processing_video_scale,
-                                index + 1, positions.size, scale))
-                        }
+                            })
                     }
                 } finally {
                     frame.recycle()
@@ -408,15 +405,15 @@ class MainActivity : AppCompatActivity() {
                     appendLine("未能读取可解析的视频帧，请检查视频是否损坏或格式是否受支持。")
                 } else {
                     when (best?.status) {
-                        ScreenWatermarkCodec.Status.INSUFFICIENT_DATA ->
+                        LocatedWatermarkCodec.Status.INSUFFICIENT_DATA ->
                             appendLine("抽样帧中检测到疑似水印头部，但数据不足，无法还原身份。")
-                        ScreenWatermarkCodec.Status.VALIDATION_FAILED ->
+                        LocatedWatermarkCodec.Status.VALIDATION_FAILED ->
                             appendLine("抽样帧中检测到疑似水印头部，但载荷校验未通过。")
                         else -> appendLine("抽样帧中未定位到可验证的水印。")
                     }
                     appendLine("水印同步相关强度：${formatScore(best?.score ?: 0.0)}")
                     appendLine("最佳候选补偿比例：${formatScale(bestScale)}（未经认证）")
-                    appendLine("已尝试定位版同步信号；旧版对前 ${minOf(decodedFrames, WatermarkScaleSearch.MAX_SEARCH_FRAMES)} 帧搜索 1～2 倍等比放大，后续帧重试候选比例。")
+                    appendLine("已对抽样帧尝试 W2 原尺度检测、缩放定位及头部校准。")
                     appendLine("比例搜索为有限候选搜索，不保证覆盖所有缩放或严重裁剪。")
                     appendLine("录屏压缩、缩放或裁剪可能削弱水印，建议使用原始高画质录屏。")
                     appendLine("结果仅覆盖抽样帧，不能据此判断整段视频不存在水印。")
@@ -446,13 +443,7 @@ class MainActivity : AppCompatActivity() {
     private fun detectDirectScreenWatermark(
         bitmap: Bitmap,
         checkCancelled: () -> Unit
-    ): ScreenWatermarkCodec.Detection {
-        checkCancelled()
-        val located = LocatedWatermarkCodec.detectDirect(bitmap, checkCancelled)
-        if (located.payload != null) return located
-        val legacy = ScreenWatermarkCodec.detectDirect(bitmap, checkCancelled)
-        return if (LocatedWatermarkCodec.better(legacy, located)) legacy else located
-    }
+    ): LocatedWatermarkCodec.Detection = LocatedWatermarkCodec.detectDirect(bitmap, checkCancelled)
 
     /** 解码整图（不缩放），因为盲水印的 LSB 位置依赖原始尺寸。 */
     private fun decodeBitmap(uri: Uri): Bitmap? {
@@ -467,7 +458,7 @@ class MainActivity : AppCompatActivity() {
     /** 在原尺度/未知尺度两条路径均未认证后，保留设备显示尺寸补偿作为兼容路径。 */
     private fun detectScreenSizeCompensation(
         bitmap: Bitmap,
-        original: ScreenWatermarkCodec.Detection,
+        original: LocatedWatermarkCodec.Detection,
         checkCancelled: () -> Unit = {}
     ): WatermarkScaleSearch.Result {
         var best = original
@@ -553,9 +544,7 @@ class MainActivity : AppCompatActivity() {
                         onStage = onProgress,
                         knownScaleFallback = {
                             detectScreenSizeCompensation(bitmap, original) { coroutine.ensureActive() }
-                        }) { scale ->
-                        onProgress(getString(R.string.processing_image_scale, scale))
-                    }
+                        })
                 } else {
                     original?.let { WatermarkScaleSearch.Result(it, originalScale) }
                 }
@@ -597,7 +586,7 @@ class MainActivity : AppCompatActivity() {
 
                         else -> {
                             when (screenDetection?.status) {
-                                ScreenWatermarkCodec.Status.INSUFFICIENT_DATA -> {
+                                LocatedWatermarkCodec.Status.INSUFFICIENT_DATA -> {
                                     appendLine("检测到疑似水印头部，但截图保留的数据不足，无法还原身份。")
                                     appendLine("头部覆盖：${screenDetection.headerBitsObserved}/32 比特")
                                     if (screenDetection.bodyBitsRequired > 0) appendLine(
@@ -605,7 +594,7 @@ class MainActivity : AppCompatActivity() {
                                     )
                                     appendLine("请保留更大的截图区域后重试。")
                                 }
-                                ScreenWatermarkCodec.Status.VALIDATION_FAILED -> {
+                                LocatedWatermarkCodec.Status.VALIDATION_FAILED -> {
                                     appendLine("检测到疑似水印头部，但载荷校验未通过。")
                                     appendLine("可能存在像素损坏、识别误差，或图片使用了其他密钥。")
                                 }
@@ -618,7 +607,7 @@ class MainActivity : AppCompatActivity() {
                             if (searched) {
                                 appendLine("最佳候选水印格式：${screenDetection?.format.orEmpty()}")
                                 appendLine("最佳候选补偿比例：${formatScale(screenResult?.scale ?: 1.0)}（未经认证）")
-                                appendLine("已尝试定位版同步信号和旧版 1～2 倍缩放搜索；仍可能因裁剪或信号损伤失败。")
+                                appendLine("已尝试 W2 原尺度检测、缩放定位及头部校准；仍可能因裁剪或信号损伤失败。")
                             }
                             if (resampled) appendLine(
                                 "图片尺寸与当前屏幕不同，已优先按原图解析，并尝试适用的等比缩放。"

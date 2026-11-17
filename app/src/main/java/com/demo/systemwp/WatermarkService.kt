@@ -152,7 +152,7 @@ class WatermarkService : Service() {
             isAntiAlias = false
             isFilterBitmap = false
             isDither = false
-            alpha = ScreenWatermarkCodec.OVERLAY_ALPHA
+            alpha = LocatedWatermarkCodec.OVERLAY_ALPHA
         }
 
         private var shader: BitmapShader? = null
@@ -188,7 +188,7 @@ class WatermarkService : Service() {
         private fun currentAlpha(): Int {
             val debug = WatermarkPrefs.prefs(context)
                 .getInt(WatermarkPrefs.KEY_DEBUG_ALPHA, 0)
-            return if (debug > 0) debug else ScreenWatermarkCodec.OVERLAY_ALPHA
+            return if (debug > 0) debug else LocatedWatermarkCodec.OVERLAY_ALPHA
         }
 
         /** 身份未变且未满一分钟时复用 tile；使用单调时钟判断刷新间隔。 */
@@ -228,7 +228,7 @@ class WatermarkService : Service() {
                 }
                 Log.i(TAG, "tile ready: format=W2 plain=${plain.size}B sealed=${sealed.size}B " +
                     "buildMs=${SystemClock.elapsedRealtime() - startedAt}")
-                ScreenWatermarkCodec.createShader(tile)
+                LocatedWatermarkCodec.createShader(tile)
             } catch (e: Exception) {
                 Log.w(TAG, "tile build failed", e)
                 null

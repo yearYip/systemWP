@@ -1,6 +1,8 @@
 package com.demo.systemwp
 
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
+import android.graphics.Shader
 import android.util.Log
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
@@ -12,16 +14,35 @@ import kotlin.math.roundToInt
 /** 定位版屏幕水印。R/B 通道承载横/纵向双频定位信号，G 通道承载正文。
  * 分离通道避免定位标识挤占正文槽位；所有通道仍使用同一个低透明度悬浮层。
  * 正文使用 6 像素周期、空间交织和扩展 Hamming 码，认证规则及密钥不变。
- * 旧版棋盘水印继续由 ScreenWatermarkCodec 解码。
  */
 object LocatedWatermarkCodec {
+    const val OVERLAY_ALPHA = 6
+    const val DEBUG_OVERLAY_ALPHA = 40
+    const val MAX_BODY_BYTES = 128
+
+    enum class Status { SUCCESS, NOT_FOUND, INSUFFICIENT_DATA, VALIDATION_FAILED }
+
+    /** 只有通过本机 GCM 认证才返回载荷，其余字段用于诊断。 */
+    data class Detection(
+        val payload: WatermarkPayload?,
+        val score: Double,
+        val status: Status = if (payload != null) Status.SUCCESS else Status.NOT_FOUND,
+        val headerBitsObserved: Int = 0,
+        val bodyBitsObserved: Int = 0,
+        val bodyBitsRequired: Int = 0,
+        val format: String = "定位版 W2"
+    )
+
+    fun createShader(tile: Bitmap): BitmapShader =
+        BitmapShader(tile, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
+
     private const val SIDE = 56
     private const val CHIP = 12
     private const val SLOTS = SIDE * SIDE
     private const val HEADER_BITS = 32
     private const val HEADER_REPEAT = 16
     private const val HEADER_SLOTS = HEADER_BITS * HEADER_REPEAT
-    private const val MAGIC = 0x5732 // W2，与旧格式 WD 区分
+    private const val MAGIC = 0x5732 // W2
     private const val FORMAT = "定位版 W2"
     private val nextRunId = AtomicLong()
 
@@ -29,7 +50,7 @@ object LocatedWatermarkCodec {
     private fun physical(logical: Int): Int = (logical * 997 + 313) % SLOTS
 
     fun buildTile(sealed: ByteArray): Bitmap? {
-        if (sealed.isEmpty() || sealed.size > ScreenWatermarkCodec.MAX_BODY_BYTES) return null
+        if (sealed.isEmpty() || sealed.size > MAX_BODY_BYTES) return null
         val body = WatermarkErrorCorrection.encode(sealed)
         val repeat = (SLOTS - HEADER_SLOTS) / body.size
         if (repeat < 1) return null
@@ -59,7 +80,7 @@ object LocatedWatermarkCodec {
     }
 
     /** 只读默认位置，不进行位置、尺度搜索。 */
-    fun detectDirect(bitmap: Bitmap, checkCancelled: () -> Unit): ScreenWatermarkCodec.Detection =
+    fun detectDirect(bitmap: Bitmap, checkCancelled: () -> Unit): Detection =
         Image(bitmap).inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
 
     suspend fun detectLocated(
@@ -169,7 +190,7 @@ object LocatedWatermarkCodec {
         return best
     }
 
-    internal fun better(a: ScreenWatermarkCodec.Detection, b: ScreenWatermarkCodec.Detection): Boolean =
+    internal fun better(a: Detection, b: Detection): Boolean =
         a.payload != null || a.status.ordinal > b.status.ordinal ||
             (a.status == b.status && a.score > b.score)
 
@@ -215,8 +236,8 @@ object LocatedWatermarkCodec {
         }
 
         fun completeUnscaledProbe(probe: UnscaledProbe, checkCancelled: () -> Unit,
-                                  diagnostic: (String) -> Unit): ScreenWatermarkCodec.Detection? {
-            var best: ScreenWatermarkCodec.Detection? = null
+                                  diagnostic: (String) -> Unit): Detection? {
+            var best: Detection? = null
             for ((index, position) in probe.positions.withIndex()) {
                 checkCancelled()
                 val geometry = refineHeader(position, checkCancelled, adjustScale = false)
@@ -391,7 +412,7 @@ object LocatedWatermarkCodec {
             checkCancelled: () -> Unit,
             onProgress: suspend (String) -> Unit,
             diagnostic: (String) -> Unit
-        ): ScreenWatermarkCodec.Detection? {
+        ): Detection? {
             val candidates = ArrayList<CropCandidate>()
             diagnostic("unscaled start scale=1.0 phases=144 chipOffsets=3136 limit=24")
             for (py in 0 until CHIP) {
@@ -431,7 +452,7 @@ object LocatedWatermarkCodec {
                 }
                 diagnostic("unscaled phaseRow=${py + 1}/$CHIP retained=${candidates.size} bestScore=${candidates.firstOrNull()?.score}")
             }
-            var best: ScreenWatermarkCodec.Detection? = null
+            var best: Detection? = null
             for ((index, candidate) in candidates.withIndex()) {
                 checkCancelled()
                 val sums = DoubleArray(SLOTS)
@@ -488,7 +509,7 @@ object LocatedWatermarkCodec {
         }
 
         fun inspect(sx: Double, sy: Double, ox: Double, oy: Double,
-                    checkCancelled: () -> Unit): ScreenWatermarkCodec.Detection =
+                    checkCancelled: () -> Unit): Detection =
             inspect(sample(sx, sy, ox, oy, checkCancelled))
 
         private fun sample(sx: Double, sy: Double, ox: Double, oy: Double,
@@ -526,7 +547,7 @@ object LocatedWatermarkCodec {
             return Samples(sums, weights)
         }
 
-        private fun inspect(samples: Samples): ScreenWatermarkCodec.Detection {
+        private fun inspect(samples: Samples): Detection {
             val sums = samples.sums
             val weights = samples.weights
             fun read(first: Int, bit: Int, bits: Int, repeats: Int): Double? {
@@ -547,26 +568,26 @@ object LocatedWatermarkCodec {
             val score = (0 until 16).sumOf {
                 (headerValues[it] ?: 0.0) * if (expected[it] == 1) 1 else -1
             } / 16.0
-            fun result(status: ScreenWatermarkCodec.Status, observed: Int = 0, required: Int = 0,
-                       payload: WatermarkPayload? = null) = ScreenWatermarkCodec.Detection(
+            fun result(status: Status, observed: Int = 0, required: Int = 0,
+                       payload: WatermarkPayload? = null) = Detection(
                 payload, max(0.0, score), status, observedHeader, observed, required, FORMAT)
             val header = WatermarkBits.bitsToBytes(IntArray(HEADER_BITS) { if ((headerValues[it] ?: 0.0) > 0) 1 else 0 })
             if ((header[0].toInt() and 255) != (MAGIC ushr 8) ||
-                (header[1].toInt() and 255) != (MAGIC and 255)) return result(ScreenWatermarkCodec.Status.NOT_FOUND)
-            if (observedHeader < HEADER_BITS) return result(ScreenWatermarkCodec.Status.INSUFFICIENT_DATA)
+                (header[1].toInt() and 255) != (MAGIC and 255)) return result(Status.NOT_FOUND)
+            if (observedHeader < HEADER_BITS) return result(Status.INSUFFICIENT_DATA)
             val length = ((header[2].toInt() and 255) shl 8) or (header[3].toInt() and 255)
-            if (length !in 1..ScreenWatermarkCodec.MAX_BODY_BYTES) return result(ScreenWatermarkCodec.Status.NOT_FOUND)
+            if (length !in 1..MAX_BODY_BYTES) return result(Status.NOT_FOUND)
             val bits = length * 16
             val repeats = (SLOTS - HEADER_SLOTS) / bits
-            if (repeats < 1) return result(ScreenWatermarkCodec.Status.NOT_FOUND)
+            if (repeats < 1) return result(Status.NOT_FOUND)
             val values = Array(bits) { read(HEADER_SLOTS, it, bits, repeats) }
             val observed = values.count { it != null }
             val encoded = Array<Int?>(bits) { values[it]?.let { value -> if (value > 0) 1 else 0 } }
             val sealed = WatermarkErrorCorrection.decode(encoded) ?: return result(
-                if (observed < bits) ScreenWatermarkCodec.Status.INSUFFICIENT_DATA else ScreenWatermarkCodec.Status.VALIDATION_FAILED,
+                if (observed < bits) Status.INSUFFICIENT_DATA else Status.VALIDATION_FAILED,
                 observed, bits)
             val payload = WatermarkCrypto.open(sealed)?.let { WatermarkPayload.decode(it) }
-            return result(if (payload == null) ScreenWatermarkCodec.Status.VALIDATION_FAILED else ScreenWatermarkCodec.Status.SUCCESS,
+            return result(if (payload == null) Status.VALIDATION_FAILED else Status.SUCCESS,
                 observed, bits, payload)
         }
     }
