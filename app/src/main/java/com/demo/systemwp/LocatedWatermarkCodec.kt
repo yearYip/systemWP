@@ -23,7 +23,6 @@ object LocatedWatermarkCodec {
     private const val HEADER_SLOTS = HEADER_BITS * HEADER_REPEAT
     private const val MAGIC = 0x5732 // W2，与旧格式 WD 区分
     private const val FORMAT = "定位版 W2"
-    private const val MAX_SCALE_DIFFERENCE = 0.008
     private val nextRunId = AtomicLong()
 
     // 997 与 3136 互质：一一映射，连续位和重复副本分散到不同位置。
@@ -78,32 +77,20 @@ object LocatedWatermarkCodec {
             return null
         }
         val image = Image(bitmap)
+        // 纯裁剪不应依赖彩色背景中的定位频谱：固定 1.0，以已知头部搜索所有整像素位置。
+        onProgress("正在按原尺寸搜索裁剪位置…")
+        val unscaled = image.detectUnscaled(checkCancelled, onProgress, ::diagnostic)
+        var best = unscaled?.let { WatermarkScaleSearch.Result(it, 1.0) }
+        if (unscaled?.payload != null) return best
         onProgress("正在搜索水印定位信号…")
         val projections = image.projections(checkCancelled)
-        val horizontal = WatermarkLocator.locate(projections.first, checkCancelled) {
-            diagnostic("axis=X $it")
-        }
-        val vertical = WatermarkLocator.locate(projections.second, checkCancelled) {
-            diagnostic("axis=Y $it")
-        }
-        diagnostic("pairing candidatesX=${horizontal.size} candidatesY=${vertical.size} " +
-            "maxRelativeDifference=$MAX_SCALE_DIFFERENCE")
-        var best: WatermarkScaleSearch.Result? = null
-        var acceptedPairs = 0
-        var rejectedPairs = 0
-        for ((xi, x) in horizontal.withIndex()) for ((yi, y) in vertical.withIndex()) {
+        val candidates = WatermarkLocator.locateJoint(projections.first, projections.second, checkCancelled, ::diagnostic)
+        for ((index, candidate) in candidates.withIndex()) {
             checkCancelled()
-            // 允许导出尺寸取整带来的轻微横纵差异，拒绝明显不等比的伪候选。
-            val difference = abs(x.scale - y.scale) / max(x.scale, y.scale)
-            val pairDetails = "pairX=${xi + 1} pairY=${yi + 1} sx=${x.scale} sy=${y.scale} " +
-                "scoreX=${x.score} scoreY=${y.score} relativeDifference=$difference"
-            if (difference > MAX_SCALE_DIFFERENCE) {
-                rejectedPairs++
-                diagnostic("$pairDetails rejected reason=scale_mismatch threshold=$MAX_SCALE_DIFFERENCE")
-                continue
-            }
-            acceptedPairs++
-            diagnostic("$pairDetails accepted")
+            val x = candidate.x
+            val y = candidate.y
+            val pairDetails = "joint candidate=${index + 1} scale=${x.scale} " +
+                "scoreX=${x.score} scoreY=${y.score} jointScore=${candidate.score}"
             onProgress("已找到候选定位信号，正在对齐并验证…")
             val scale = (x.scale + y.scale) / 2.0
             Log.i("SystemWP", "locator sx=${x.scale} sy=${y.scale} " +
@@ -139,12 +126,8 @@ object LocatedWatermarkCodec {
                 "header=${pairBest?.headerBitsObserved}/32 " +
                 "body=${pairBest?.bodyBitsObserved}/${pairBest?.bodyBitsRequired}")
         }
-        val reason = when {
-            horizontal.isEmpty() || vertical.isEmpty() -> "missing_axis_candidates"
-            acceptedPairs == 0 -> "no_compatible_scale_pair"
-            else -> "all_decode_attempts_failed"
-        }
-        diagnostic("complete reason=$reason acceptedPairs=$acceptedPairs rejectedPairs=$rejectedPairs " +
+        val reason = if (candidates.isEmpty()) "no_joint_scale_candidates" else "all_decode_attempts_failed"
+        diagnostic("complete reason=$reason jointCandidates=${candidates.size} " +
             "bestStatus=${best?.detection?.status}")
         return best
     }
@@ -153,10 +136,93 @@ object LocatedWatermarkCodec {
         a.payload != null || a.status.ordinal > b.status.ordinal ||
             (a.status == b.status && a.score > b.score)
 
+    private class Samples(val sums: DoubleArray, val weights: DoubleArray)
+
+    private val magicBits = WatermarkBits.bytesToBits(byteArrayOf((MAGIC ushr 8).toByte(), MAGIC.toByte()))
+    private val magicSlots = IntArray(16 * HEADER_REPEAT) { physical(it / 16 * HEADER_BITS + it % 16) }
+    private val magicSigns = IntArray(magicSlots.size) {
+        WatermarkBits.pnSign(magicSlots[it]) * if (magicBits[it % 16] == 1) 1 else -1
+    }
+    private val shiftedCoordinates = Array(SIDE) { shift -> IntArray(SIDE) { Math.floorMod(it - shift, SIDE) } }
+
     private class Image(bitmap: Bitmap) {
         val width = bitmap.width
         val height = bitmap.height
         val pixels = IntArray(width * height).also { bitmap.getPixels(it, 0, width, 0, 0, width, height) }
+
+        private data class CropCandidate(val phaseX: Int, val phaseY: Int, val chipX: Int, val chipY: Int,
+                                         val score: Double, val samples: Samples)
+
+        suspend fun detectUnscaled(
+            checkCancelled: () -> Unit,
+            onProgress: suspend (String) -> Unit,
+            diagnostic: (String) -> Unit
+        ): ScreenWatermarkCodec.Detection? {
+            val candidates = ArrayList<CropCandidate>()
+            diagnostic("unscaled start scale=1.0 phases=144 chipOffsets=3136 limit=24")
+            for (py in 0 until CHIP) {
+                onProgress("正在按原尺寸搜索裁剪位置：${py + 1} / $CHIP")
+                for (px in 0 until CHIP) {
+                    checkCancelled()
+                    val samples = sample(1.0, 1.0, px.toDouble(), py.toDouble(), checkCancelled)
+                    val averages = DoubleArray(SLOTS) {
+                        if (samples.weights[it] > 0) samples.sums[it] / samples.weights[it] else 0.0
+                    }
+                    for (cy in 0 until SIDE) {
+                        checkCancelled()
+                        val rows = shiftedCoordinates[cy]
+                        for (cx in 0 until SIDE) {
+                            val columns = shiftedCoordinates[cx]
+                            var sum = 0.0
+                            var count = 0
+                            var observed = 0
+                            for (i in magicSlots.indices) {
+                                val slot = magicSlots[i]
+                                val source = rows[slot / SIDE] * SIDE + columns[slot % SIDE]
+                                if (samples.weights[source] > 0) {
+                                    sum += magicSigns[i] * averages[source]
+                                    count++
+                                    observed = observed or (1 shl (i % 16))
+                                }
+                            }
+                            if (count < 64 || Integer.bitCount(observed) < 12) continue
+                            val score = sum / count * kotlin.math.sqrt(count.toDouble() / magicSlots.size)
+                            if (score <= 0 || (candidates.size == 24 && score <= candidates.last().score)) continue
+                            candidates.add(CropCandidate(px, py, cx, cy, score, samples))
+                            candidates.sortByDescending { it.score }
+                            if (candidates.size > 24) candidates.removeAt(candidates.lastIndex)
+                        }
+                    }
+                }
+                diagnostic("unscaled phaseRow=${py + 1}/$CHIP retained=${candidates.size} bestScore=${candidates.firstOrNull()?.score}")
+            }
+            var best: ScreenWatermarkCodec.Detection? = null
+            for ((index, candidate) in candidates.withIndex()) {
+                checkCancelled()
+                val sums = DoubleArray(SLOTS)
+                val weights = DoubleArray(SLOTS)
+                for (slot in 0 until SLOTS) {
+                    val source = shiftedCoordinates[candidate.chipY][slot / SIDE] * SIDE +
+                        shiftedCoordinates[candidate.chipX][slot % SIDE]
+                    sums[slot] = candidate.samples.sums[source]
+                    weights[slot] = candidate.samples.weights[source]
+                }
+                val detection = inspect(Samples(sums, weights))
+                diagnostic("unscaled candidate=${index + 1} scale=1.0 " +
+                    "offsetX=${candidate.phaseX + candidate.chipX * CHIP} " +
+                    "offsetY=${candidate.phaseY + candidate.chipY * CHIP} score=${candidate.score} " +
+                    "status=${detection.status} header=${detection.headerBitsObserved}/32 " +
+                    "body=${detection.bodyBitsObserved}/${detection.bodyBitsRequired}")
+                val previous = best
+                if (previous == null || better(detection, previous)) best = detection
+                if (detection.payload != null) {
+                    diagnostic("complete reason=success stage=unscaled scale=1.0")
+                    return detection
+                }
+            }
+            diagnostic("unscaled complete reason=no_authenticated_candidate candidates=${candidates.size} bestStatus=${best?.status}")
+            return best
+        }
 
         fun projections(checkCancelled: () -> Unit): Pair<DoubleArray, DoubleArray> {
             val x = DoubleArray(width)
@@ -187,7 +253,11 @@ object LocatedWatermarkCodec {
         }
 
         fun inspect(sx: Double, sy: Double, ox: Double, oy: Double,
-                    checkCancelled: () -> Unit): ScreenWatermarkCodec.Detection {
+                    checkCancelled: () -> Unit): ScreenWatermarkCodec.Detection =
+            inspect(sample(sx, sy, ox, oy, checkCancelled))
+
+        private fun sample(sx: Double, sy: Double, ox: Double, oy: Double,
+                           checkCancelled: () -> Unit): Samples {
             val sums = DoubleArray(SLOTS)
             val weights = DoubleArray(SLOTS)
             // 每个 6×6 棋盘的四个子块中心配对作差，不需要把整图缩放取整。
@@ -217,6 +287,12 @@ object LocatedWatermarkCodec {
                     }
                 }
             }
+            return Samples(sums, weights)
+        }
+
+        private fun inspect(samples: Samples): ScreenWatermarkCodec.Detection {
+            val sums = samples.sums
+            val weights = samples.weights
             fun read(first: Int, bit: Int, bits: Int, repeats: Int): Double? {
                 var sum = 0.0
                 var weight = 0.0
