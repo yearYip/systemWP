@@ -95,36 +95,18 @@ object LocatedWatermarkCodec {
             val scale = (x.scale + y.scale) / 2.0
             Log.i("SystemWP", "locator sx=${x.scale} sy=${y.scale} " +
                 "x=${x.offset} y=${y.offset} scoreX=${x.score} scoreY=${y.score} run=$runId")
-            val statuses = IntArray(ScreenWatermarkCodec.Status.entries.size)
-            var pairBest: ScreenWatermarkCodec.Detection? = null
-            // 双频给出亚像素坐标；邻域细化弥补背景、插值造成的相位偏差。
-            for (delta in doubleArrayOf(0.0, -0.0002, 0.0002)) {
-                for (dy in doubleArrayOf(0.0, -0.5, 0.5, -1.0, 1.0)) {
-                    for (dx in doubleArrayOf(0.0, -0.5, 0.5, -1.0, 1.0)) {
-                        checkCancelled()
-                        val detection = image.inspect(x.scale + delta, y.scale + delta,
-                            x.offset + dx, y.offset + dy, checkCancelled)
-                        val result = WatermarkScaleSearch.Result(detection, scale + delta)
-                        statuses[detection.status.ordinal]++
-                        val previousPair = pairBest
-                        if (previousPair == null || better(detection, previousPair)) pairBest = detection
-                        val previous = best
-                        if (previous == null || better(detection, previous.detection)) best = result
-                        if (detection.payload != null) {
-                            diagnostic("complete reason=success $pairDetails scaleDelta=$delta " +
-                                "offsetX=${x.offset + dx} offsetY=${y.offset + dy} " +
-                                "header=${detection.headerBitsObserved}/32 " +
-                                "body=${detection.bodyBitsObserved}/${detection.bodyBitsRequired}")
-                            return result
-                        }
-                    }
+            val calibrated = image.calibrateHeader(scale, checkCancelled, onProgress) {
+                diagnostic("candidate=${index + 1} $it")
+            }
+            if (calibrated != null) {
+                val previous = best
+                if (previous == null || better(calibrated.detection, previous.detection)) best = calibrated
+                if (calibrated.detection.payload != null) {
+                    diagnostic("complete reason=success stage=header_calibration $pairDetails " +
+                        "calibratedScale=${calibrated.scale}")
+                    return calibrated
                 }
             }
-            diagnostic("$pairDetails decode_failed attempts=${statuses.sum()} " +
-                "statuses=${ScreenWatermarkCodec.Status.entries.joinToString { "${it.name}:${statuses[it.ordinal]}" }} " +
-                "bestStatus=${pairBest?.status} bestScore=${pairBest?.score} " +
-                "header=${pairBest?.headerBitsObserved}/32 " +
-                "body=${pairBest?.bodyBitsObserved}/${pairBest?.bodyBitsRequired}")
         }
         val reason = if (candidates.isEmpty()) "no_joint_scale_candidates" else "all_decode_attempts_failed"
         diagnostic("complete reason=$reason jointCandidates=${candidates.size} " +
@@ -144,6 +126,9 @@ object LocatedWatermarkCodec {
         WatermarkBits.pnSign(magicSlots[it]) * if (magicBits[it % 16] == 1) 1 else -1
     }
     private val shiftedCoordinates = Array(SIDE) { shift -> IntArray(SIDE) { Math.floorMod(it - shift, SIDE) } }
+    // 粗定位使用每个 magic bit 的四份空间分散副本；精校准再读取全部 16 份。
+    private val coarseMagicIndices = IntArray(64) { it / 16 * 64 + it % 16 }
+    private val isMagicSlot = BooleanArray(SLOTS).also { mask -> magicSlots.forEach { mask[it] = true } }
 
     private class Image(bitmap: Bitmap) {
         val width = bitmap.width
@@ -152,6 +137,155 @@ object LocatedWatermarkCodec {
 
         private data class CropCandidate(val phaseX: Int, val phaseY: Int, val chipX: Int, val chipY: Int,
                                          val score: Double, val samples: Samples)
+
+        private data class Geometry(val scale: Double, val x: Double, val y: Double, val score: Double)
+        private data class HeaderEvidence(val score: Double, val matchingBits: Int, val observedSlots: Int)
+
+        /** 频谱只提供尺度初值；位置及最终尺度由已知 magic 的真实 G 通道信号校准。
+         * 整数恢复宽度保留相邻值，连续采样避免再次缩放 bitmap 引入插值。
+         */
+        suspend fun calibrateHeader(
+            estimatedScale: Double,
+            checkCancelled: () -> Unit,
+            onProgress: suspend (String) -> Unit,
+            diagnostic: (String) -> Unit
+        ): WatermarkScaleSearch.Result? {
+            val centerWidth = (width * estimatedScale).roundToInt()
+            val widths = (listOf(0) + (1..4).flatMap { listOf(-it, it) })
+                .map { centerWidth + it }
+                .filter { it >= 64 && it.toDouble() / width in 0.45..1.10 }
+            diagnostic("calibration start estimatedScale=$estimatedScale centerWidth=$centerWidth " +
+                "widths=${widths.joinToString()} phaseStep=2 coarseMagicSlots=64")
+            var best: WatermarkScaleSearch.Result? = null
+            var attempts = 0
+            for ((index, restoredWidth) in widths.withIndex()) {
+                checkCancelled()
+                val scale = restoredWidth.toDouble() / width
+                onProgress("正在用水印头部校准比例和位置：${index + 1} / ${widths.size}")
+                val positions = searchHeaderPositions(scale, checkCancelled)
+                diagnostic("calibration width=$restoredWidth scale=$scale positions=${positions.size} " +
+                    "coarseScore=${positions.firstOrNull()?.score}")
+                // 每个恢复宽度独立保留位置，不让错误宽度的高分提前淘汰相邻宽度。
+                for (position in positions) {
+                    val geometry = refineHeader(position, checkCancelled)
+                    val evidence = headerEvidence(geometry, checkCancelled)
+                    val detection = inspect(geometry.scale, geometry.scale, geometry.x, geometry.y, checkCancelled)
+                    val result = WatermarkScaleSearch.Result(detection, geometry.scale)
+                    attempts++
+                    diagnostic("calibration attempt=$attempts restoredWidth=$restoredWidth " +
+                        "scale=${geometry.scale} offsetX=${geometry.x} offsetY=${geometry.y} " +
+                        "coarseScore=${position.score} headerScore=${evidence.score} " +
+                        "magicMatches=${evidence.matchingBits}/16 magicSlots=${evidence.observedSlots}/256 " +
+                        "status=${detection.status} header=${detection.headerBitsObserved}/32 " +
+                        "body=${detection.bodyBitsObserved}/${detection.bodyBitsRequired}")
+                    val previous = best
+                    if (previous == null || better(detection, previous.detection)) best = result
+                    if (detection.payload != null) {
+                        diagnostic("calibration complete reason=success attempts=$attempts scale=${geometry.scale}")
+                        return result
+                    }
+                }
+            }
+            diagnostic("calibration complete reason=no_authenticated_candidate attempts=$attempts " +
+                "bestStatus=${best?.detection?.status}")
+            return best
+        }
+
+        private fun searchHeaderPositions(scale: Double, checkCancelled: () -> Unit): List<Geometry> {
+            val strongest = ArrayList<Geometry>()
+            for (py in 0 until CHIP step 2) for (px in 0 until CHIP step 2) {
+                checkCancelled()
+                val samples = sample(scale, scale, px.toDouble(), py.toDouble(), checkCancelled)
+                val averages = DoubleArray(SLOTS) {
+                    if (samples.weights[it] > 0) samples.sums[it] / samples.weights[it] else 0.0
+                }
+                for (cy in 0 until SIDE) {
+                    checkCancelled()
+                    val rows = shiftedCoordinates[cy]
+                    for (cx in 0 until SIDE) {
+                        val columns = shiftedCoordinates[cx]
+                        var sum = 0.0
+                        var count = 0
+                        var observed = 0
+                        for (i in coarseMagicIndices) {
+                            val slot = magicSlots[i]
+                            val source = rows[slot / SIDE] * SIDE + columns[slot % SIDE]
+                            if (samples.weights[source] > 0) {
+                                sum += magicSigns[i] * averages[source]
+                                count++
+                                observed = observed or (1 shl (i % 16))
+                            }
+                        }
+                        if (count < 32 || Integer.bitCount(observed) < 12) continue
+                        val score = sum / count * kotlin.math.sqrt(count / 64.0)
+                        if (score <= 0 || (strongest.size == 32 && score <= strongest.last().score)) continue
+                        strongest.add(Geometry(scale, (px + cx * CHIP).toDouble(),
+                            (py + cy * CHIP).toDouble(), score))
+                        strongest.sortByDescending { it.score }
+                        if (strongest.size > 32) strongest.removeAt(strongest.lastIndex)
+                    }
+                }
+            }
+            // 相同位置附近的像素相位不应占满四个精校准名额。
+            val selected = ArrayList<Geometry>()
+            for (candidate in strongest) {
+                if (selected.all { periodicDistance(it.x, candidate.x) > 4.0 || periodicDistance(it.y, candidate.y) > 4.0 }) {
+                    selected.add(candidate)
+                    if (selected.size == 4) break
+                }
+            }
+            return selected
+        }
+
+        private fun periodicDistance(a: Double, b: Double): Double {
+            val distance = abs(a - b) % WatermarkLocator.TILE
+            return minOf(distance, WatermarkLocator.TILE - distance)
+        }
+
+        private fun headerEvidence(geometry: Geometry, checkCancelled: () -> Unit): HeaderEvidence {
+            val samples = sample(geometry.scale, geometry.scale, geometry.x, geometry.y, checkCancelled, magicOnly = true)
+            val bitSums = DoubleArray(16)
+            var sum = 0.0
+            var count = 0
+            for (i in magicSlots.indices) {
+                val slot = magicSlots[i]
+                if (samples.weights[slot] > 0) {
+                    val value = magicSigns[i] * samples.sums[slot] / samples.weights[slot]
+                    sum += value
+                    bitSums[i % 16] += value
+                    count++
+                }
+            }
+            val score = if (count < 64) 0.0 else sum / count * kotlin.math.sqrt(count / 256.0)
+            return HeaderEvidence(score, bitSums.count { it > 0 }, count)
+        }
+
+        private fun refineHeader(initial: Geometry, checkCancelled: () -> Unit): Geometry {
+            var best = initial.copy(score = headerEvidence(initial, checkCancelled).score)
+            // 位置与比例交替优化。改变比例时保持图像中心的水印坐标，减少两者的耦合。
+            for (step in doubleArrayOf(1.0, 0.5, 0.25)) {
+                repeat(2) {
+                    val center = best
+                    for (dy in -1..1) for (dx in -1..1) {
+                        checkCancelled()
+                        val candidate = center.copy(x = center.x + dx * step, y = center.y + dy * step)
+                        val score = headerEvidence(candidate, checkCancelled).score
+                        if (score > best.score) best = candidate.copy(score = score)
+                    }
+                    val scaleCenter = best
+                    for (direction in intArrayOf(-1, 1)) {
+                        val delta = direction * step / (2.0 * width)
+                        val scale = scaleCenter.scale + delta
+                        if (scale !in 0.45..1.10) continue
+                        val candidate = Geometry(scale, scaleCenter.x - delta * width / 2,
+                            scaleCenter.y - delta * height / 2, 0.0)
+                        val score = headerEvidence(candidate, checkCancelled).score
+                        if (score > best.score) best = candidate.copy(score = score)
+                    }
+                }
+            }
+            return best
+        }
 
         suspend fun detectUnscaled(
             checkCancelled: () -> Unit,
@@ -257,7 +391,7 @@ object LocatedWatermarkCodec {
             inspect(sample(sx, sy, ox, oy, checkCancelled))
 
         private fun sample(sx: Double, sy: Double, ox: Double, oy: Double,
-                           checkCancelled: () -> Unit): Samples {
+                           checkCancelled: () -> Unit, magicOnly: Boolean = false): Samples {
             val sums = DoubleArray(SLOTS)
             val weights = DoubleArray(SLOTS)
             // 每个 6×6 棋盘的四个子块中心配对作差，不需要把整图缩放取整。
@@ -270,6 +404,7 @@ object LocatedWatermarkCodec {
                 checkCancelled()
                 for (cx in minX until maxX) {
                     val slot = Math.floorMod(cy, SIDE) * SIDE + Math.floorMod(cx, SIDE)
+                    if (magicOnly && !isMagicSlot[slot]) continue
                     for (by in 0..1) for (bx in 0..1) {
                         val x0 = (cx * CHIP + bx * 6 + 1.5 - ox) / sx - 0.5
                         val x1 = (cx * CHIP + bx * 6 + 4.5 - ox) / sx - 0.5
