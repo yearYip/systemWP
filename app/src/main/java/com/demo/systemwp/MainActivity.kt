@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Display
@@ -30,6 +31,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -44,9 +46,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etDeviceId: EditText
     private lateinit var btnToggle: Button
     private lateinit var tvResult: TextView
+    private lateinit var tvParseElapsed: TextView
 
     private var startIssued = false
     private var parseJob: Job? = null
+    private var parseTimerJob: Job? = null
+    private var parseStartedAt: Long? = null
     private lateinit var btnCancelParse: Button
 
     private val identityHandler = Handler(Looper.getMainLooper())
@@ -81,9 +86,11 @@ class MainActivity : AppCompatActivity() {
         etDeviceId = findViewById(R.id.et_device_id)
         btnToggle = findViewById(R.id.btn_toggle)
         tvResult = findViewById(R.id.tv_result)
+        tvParseElapsed = findViewById(R.id.tv_parse_elapsed)
         btnCancelParse = findViewById(R.id.btn_cancel_parse)
         btnCancelParse.setOnClickListener {
             parseJob?.cancel()
+            finishParseTimer()
             btnCancelParse.visibility = android.view.View.GONE
             tvResult.setText(R.string.parse_cancelled)
         }
@@ -219,8 +226,34 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- 水印解析
 
+    /** 使用单调时钟独立刷新计时，不依赖后台算法发送进度的频率。 */
+    private fun startParseTimer() {
+        parseTimerJob?.cancel()
+        val startedAt = SystemClock.elapsedRealtime()
+        parseStartedAt = startedAt
+        tvParseElapsed.visibility = android.view.View.VISIBLE
+        tvParseElapsed.text = getString(R.string.parse_elapsed_running, 0.0)
+        parseTimerJob = lifecycleScope.launch {
+            while (true) {
+                delay(1_000)
+                tvParseElapsed.text = getString(R.string.parse_elapsed_running,
+                    (SystemClock.elapsedRealtime() - startedAt) / 1_000.0)
+            }
+        }
+    }
+
+    private fun finishParseTimer() {
+        val startedAt = parseStartedAt ?: return
+        parseTimerJob?.cancel()
+        parseTimerJob = null
+        parseStartedAt = null
+        tvParseElapsed.text = getString(R.string.parse_elapsed_finished,
+            (SystemClock.elapsedRealtime() - startedAt) / 1_000.0)
+    }
+
     private fun parseImage(uri: Uri) {
         parseJob?.cancel()
+        startParseTimer()
         btnCancelParse.visibility = android.view.View.VISIBLE
         tvResult.setText(R.string.processing)
         parseJob = lifecycleScope.launch {
@@ -233,6 +266,7 @@ class MainActivity : AppCompatActivity() {
                 tvResult.text = result
             } finally {
                 if (parseJob == currentCoroutineContext()[Job]) {
+                    finishParseTimer()
                     btnCancelParse.visibility = android.view.View.GONE
                 }
             }
@@ -241,6 +275,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun parseVideo(uri: Uri) {
         parseJob?.cancel()
+        startParseTimer()
         tvResult.setText(R.string.processing)
         btnCancelParse.visibility = android.view.View.VISIBLE
         parseJob = lifecycleScope.launch {
@@ -254,6 +289,7 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 // 被新任务替换后，旧任务不能修改新任务的按钮状态。
                 if (parseJob == currentCoroutineContext()[Job]) {
+                    finishParseTimer()
                     btnCancelParse.visibility = android.view.View.GONE
                 }
             }

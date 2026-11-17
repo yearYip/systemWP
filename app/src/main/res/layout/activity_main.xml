@@ -75,6 +75,14 @@
             android:textIsSelectable="true"
             android:textSize="13sp" />
 
+        <TextView
+            android:id="@+id/tv_parse_elapsed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
         <Button
             android:id="@+id/btn_cancel_parse"
             style="@style/Widget.AppCompat.Button.Borderless"
