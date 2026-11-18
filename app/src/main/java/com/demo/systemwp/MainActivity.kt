@@ -377,6 +377,9 @@ class MainActivity : AppCompatActivity() {
                         appendLine("已解析帧数：$decodedFrames")
                         appendLine("抽帧缩放补偿比例：${formatScale(result.scale)}")
                         appendLine("水印格式：${detection.format}")
+                        if (detection.rotationDegrees != 0) {
+                            appendLine("旋转补偿：顺时针 ${detection.rotationDegrees}°")
+                        }
                         if (detection.horizontalMirrored) appendLine("水平镜像补偿：已应用")
                         appendLine()
                         appendLine("检测到屏幕暗水印：")
@@ -575,6 +578,9 @@ class MainActivity : AppCompatActivity() {
                             appendLine("时间戳：${formatTimestamp(screenPayload.timestamp)}")
                             appendLine("图片缩放补偿比例：${formatScale(screenResult?.scale ?: originalScale)}")
                             appendLine("水印格式：${screenDetection?.format.orEmpty()}")
+                            if (screenDetection != null && screenDetection.rotationDegrees != 0) {
+                                appendLine("旋转补偿：顺时针 ${screenDetection.rotationDegrees}°")
+                            }
                             if (screenDetection?.horizontalMirrored == true) appendLine("水平镜像补偿：已应用")
                             appendLine("（载荷由本机 Keystore 密钥加密，仅本机可解）")
                         }

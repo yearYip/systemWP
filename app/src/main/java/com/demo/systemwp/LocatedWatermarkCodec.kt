@@ -31,7 +31,8 @@ object LocatedWatermarkCodec {
         val bodyBitsObserved: Int = 0,
         val bodyBitsRequired: Int = 0,
         val format: String = "定位版 W2",
-        val horizontalMirrored: Boolean = false
+        val horizontalMirrored: Boolean = false,
+        val rotationDegrees: Int = 0
     )
 
     fun createShader(tile: Bitmap): BitmapShader =
@@ -84,13 +85,20 @@ object LocatedWatermarkCodec {
     fun detectDirect(bitmap: Bitmap, checkCancelled: () -> Unit): Detection =
         Image(bitmap).inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
 
-    /** 屏幕尺寸补偿的直接读取：共用像素缓存，两个方向均须认证。 */
+    /** 屏幕尺寸补偿的直接读取：共用像素缓存，尝试四个旋转方向及其镜像。 */
     fun detectDirectWithMirror(bitmap: Bitmap, checkCancelled: () -> Unit): Detection {
         val image = Image(bitmap)
-        val normal = image.inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
-        if (normal.payload != null) return normal
-        val mirrored = image.mirrored().inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
-        return if (better(mirrored, normal)) mirrored else normal
+        var best: Detection? = null
+        for (rotation in 0..3) {
+            val rotated = image.rotated(rotation)
+            for (direction in listOf(rotated, rotated.mirrored())) {
+                checkCancelled()
+                val result = direction.inspect(1.0, 1.0, 0.0, 0.0, checkCancelled)
+                if (result.payload != null) return result
+                if (best == null || better(result, best)) best = result
+            }
+        }
+        return requireNotNull(best)
     }
 
     suspend fun detectLocated(
@@ -109,7 +117,12 @@ object LocatedWatermarkCodec {
         }
         val normalImage = Image(bitmap)
         data class Direction(val image: Image, val probe: Image.UnscaledProbe, val label: String)
-        val directions = listOf(normalImage to "正向", normalImage.mirrored() to "水平镜像补偿").map { (image, label) ->
+        val orientations = (0..3).flatMap { rotation ->
+            val image = normalImage.rotated(rotation)
+            val label = "顺时针旋转 ${rotation * 90}°"
+            listOf(image to label, image.mirrored() to "$label + 水平镜像补偿")
+        }
+        val directions = orientations.map { (image, label) ->
             checkCancelled()
             onProgress("正在预检方向：$label")
             val probe = image.probeUnscaled(checkCancelled) { diagnostic("direction=$label $it") }
@@ -120,16 +133,17 @@ object LocatedWatermarkCodec {
         var best: WatermarkScaleSearch.Result? = null
         for ((index, direction) in directions.withIndex()) {
             checkCancelled()
-            diagnostic("orientation attempt=${index + 1}/2 direction=${direction.label}")
+            diagnostic("orientation attempt=${index + 1}/${directions.size} direction=${direction.label}")
             val result = detectDirection(direction.image, direction.probe, checkCancelled,
                 onProgress = { progress ->
-                    onProgress("解析方向：${direction.label}（${index + 1} / 2）\n$progress")
+                    onProgress("解析方向：${direction.label}（${index + 1} / ${directions.size}）\n$progress")
                 }, diagnostic = { diagnostic("direction=${direction.label} $it") })
             if (result != null) {
                 val previous = best
                 if (previous == null || better(result.detection, previous.detection)) best = result
                 if (result.detection.payload != null) {
-                    diagnostic("orientation complete reason=success horizontalMirrored=${result.detection.horizontalMirrored}")
+                    diagnostic("orientation complete reason=success rotationDegrees=${result.detection.rotationDegrees} " +
+                        "horizontalMirrored=${result.detection.horizontalMirrored}")
                     return result
                 }
             }
@@ -253,18 +267,37 @@ object LocatedWatermarkCodec {
     private val isMagicSlot = BooleanArray(SLOTS).also { mask -> magicSlots.forEach { mask[it] = true } }
 
     private class Image private constructor(
-        val width: Int,
-        val height: Int,
+        val sourceWidth: Int,
+        val sourceHeight: Int,
         val pixels: IntArray,
-        val horizontalMirrored: Boolean
+        val horizontalMirrored: Boolean,
+        val quarterTurns: Int
     ) {
         constructor(bitmap: Bitmap) : this(bitmap.width, bitmap.height,
             IntArray(bitmap.width * bitmap.height).also {
                 bitmap.getPixels(it, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-            }, false)
+            }, false, 0)
+
+        val width: Int get() = if (quarterTurns % 2 == 0) sourceWidth else sourceHeight
+        val height: Int get() = if (quarterTurns % 2 == 0) sourceHeight else sourceWidth
 
         // 两个方向只共享不可变像素；相位缓存独立，避免混用方向不同的采样。
-        fun mirrored(): Image = Image(width, height, pixels, !horizontalMirrored)
+        fun mirrored(): Image = Image(sourceWidth, sourceHeight, pixels, !horizontalMirrored, quarterTurns)
+
+        fun rotated(turns: Int): Image = Image(sourceWidth, sourceHeight, pixels, false, turns)
+
+        // 先顺时针旋转，再在旋转后的坐标中应用水平镜像；整数坐标映射不插值。
+        private fun pixelAt(column: Int, row: Int): Int {
+            val x = if (horizontalMirrored) width - 1 - column else column
+            val index = when (quarterTurns) {
+                0 -> row * sourceWidth + x
+                1 -> (sourceHeight - 1 - x) * sourceWidth + row
+                2 -> (sourceHeight - 1 - row) * sourceWidth + sourceWidth - 1 - x
+                3 -> x * sourceWidth + sourceWidth - 1 - row
+                else -> error("Unsupported rotation: $quarterTurns")
+            }
+            return pixels[index]
+        }
 
         private data class CropCandidate(val phaseX: Int, val phaseY: Int, val chipX: Int, val chipY: Int,
                                          val score: Double, val samples: Samples)
@@ -545,8 +578,7 @@ object LocatedWatermarkCodec {
             for (row in 0 until height) {
                 if (row % 32 == 0) checkCancelled()
                 for (column in 0 until width) {
-                    val sourceColumn = if (horizontalMirrored) width - 1 - column else column
-                    val pixel = pixels[row * width + sourceColumn]
+                    val pixel = pixelAt(column, row)
                     val g = (pixel ushr 8) and 255
                     x[column] += ((pixel ushr 16) and 255) - g
                     y[row] += (pixel and 255) - g
@@ -563,8 +595,7 @@ object LocatedWatermarkCodec {
             val fx = x - ix
             val fy = y - iy
             fun at(dx: Int, dy: Int): Double {
-                val column = if (horizontalMirrored) width - 1 - (ix + dx) else ix + dx
-                return ((pixels[(iy + dy) * width + column] ushr 8) and 255).toDouble()
+                return ((pixelAt(ix + dx, iy + dy) ushr 8) and 255).toDouble()
             }
             return (at(0, 0) * (1 - fx) + at(1, 0) * fx) * (1 - fy) +
                 (at(0, 1) * (1 - fx) + at(1, 1) * fx) * fy
@@ -632,7 +663,8 @@ object LocatedWatermarkCodec {
             } / 16.0
             fun result(status: Status, observed: Int = 0, required: Int = 0,
                        payload: WatermarkPayload? = null) = Detection(
-                payload, max(0.0, score), status, observedHeader, observed, required, FORMAT, horizontalMirrored)
+                payload, max(0.0, score), status, observedHeader, observed, required, FORMAT,
+                horizontalMirrored, quarterTurns * 90)
             val header = WatermarkBits.bitsToBytes(IntArray(HEADER_BITS) { if ((headerValues[it] ?: 0.0) > 0) 1 else 0 })
             if ((header[0].toInt() and 255) != (MAGIC ushr 8) ||
                 (header[1].toInt() and 255) != (MAGIC and 255)) return result(Status.NOT_FOUND)
