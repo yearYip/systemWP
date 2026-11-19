@@ -12,8 +12,8 @@ android {
         applicationId = "com.demo.systemwp"
         minSdk = 29
         targetSdk = 37
-        versionCode = 15
-        versionName = "1.0.14"
+        versionCode = 16
+        versionName = "1.0.15"
     }
 
     compileOptions {

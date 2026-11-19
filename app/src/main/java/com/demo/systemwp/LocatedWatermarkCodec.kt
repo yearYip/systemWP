@@ -239,6 +239,36 @@ object LocatedWatermarkCodec {
                                     if (best?.detection?.payload != null) break@rotationLoop
                                 }
                             }
+                            // 原有候选均未认证后，直接在截图坐标中联合拟合八个定位波。
+                            if (best?.detection?.payload == null && angles.isNotEmpty() && budget.remainingMs() > 2000) {
+                                report("旋转路径：原有定位未认证，正在准备八信号联合精定位…")
+                                val joint = measured("joint_signal_prepare", ::diagnostic, timings) {
+                                    WatermarkJointLocator.prepare(normalImage.pixels, bitmap.width, bitmap.height, budget::check)
+                                }
+                                val fitMs = minOf(30000L, maxOf(0L, budget.remainingMs() - 1500))
+                                report("旋转路径：直接拟合八个定位信号的角度、比例与裁剪偏移…")
+                                val geometries = measured("joint_signal_fit", ::diagnostic, timings) {
+                                    joint.locate(angles, fitMs, budget::check, ::diagnostic)
+                                }
+                                for ((index, geometry) in geometries.withIndex()) {
+                                    budget.check()
+                                    val rotated = normalImage.atAngle(geometry.degrees)
+                                    val image = if (geometry.mirrored) rotated.mirrored() else rotated
+                                    fun periodic(value: Double) = (value % WatermarkLocator.TILE + WatermarkLocator.TILE) % WatermarkLocator.TILE
+                                    // 拟合给出源图中心的水印坐标，转换成现有采样器使用的视图原点偏移。
+                                    val position = Image.Geometry(geometry.scale,
+                                        periodic(geometry.centerX - geometry.scale * image.width / 2),
+                                        periodic(geometry.centerY - geometry.scale * image.height / 2), geometry.score)
+                                    report("旋转路径：八信号联合精定位候选 ${index + 1}/${geometries.size}，校准头部并认证…")
+                                    val result = measured("joint_geometry_decode", ::diagnostic, timings) {
+                                        image.decodePositions(listOf(position), true, budget, timings, ::diagnostic)
+                                    }
+                                    remember(result)
+                                    diagnostic("joint_decode candidate=${index + 1} degrees=${geometry.degrees} " +
+                                        "scale=${geometry.scale} mirror=${geometry.mirrored} status=${result?.detection?.status}")
+                                    if (best?.detection?.payload != null) break
+                                }
+                            }
                         }
                     }
                 } catch (_: SearchLimitReached) {

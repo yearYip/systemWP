@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Typeface
 import android.hardware.display.DisplayManager
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -17,6 +18,7 @@ import android.provider.Settings
 import android.text.Spannable
 import android.text.SpannableStringBuilder
 import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
 import android.util.Log
 import android.view.Display
 import android.widget.Button
@@ -399,6 +401,16 @@ class MainActivity : AppCompatActivity() {
             (SystemClock.elapsedRealtime() - startedAt) / 1_000.0)
     }
 
+    private fun formatParseResult(result: String): CharSequence {
+        val formatted = SpannableStringBuilder(result)
+        val identityLines = Regex("(?m)^(?:用户名：|设备 ID：|时间戳：)[^\\r\\n]*")
+        identityLines.findAll(result).forEach { match ->
+            formatted.setSpan(StyleSpan(Typeface.BOLD), match.range.first,
+                match.range.last + 1, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        return formatted
+    }
+
     private fun parseImage(uri: Uri) {
         parseJob?.cancel()
         startParseTimer()
@@ -412,7 +424,7 @@ class MainActivity : AppCompatActivity() {
                         withContext(Dispatchers.Main) { showParseProgress(progress) }
                     }
                 }
-                tvResult.text = result
+                tvResult.text = formatParseResult(result)
             } finally {
                 if (parseJob == currentCoroutineContext()[Job]) {
                     finishParseTimer()
@@ -436,7 +448,7 @@ class MainActivity : AppCompatActivity() {
                         withContext(Dispatchers.Main) { showParseProgress(progress) }
                     }
                 }
-                tvResult.text = result
+                tvResult.text = formatParseResult(result)
             } finally {
                 // 被新任务替换后，旧任务不能修改新任务的按钮状态。
                 if (parseJob == currentCoroutineContext()[Job]) {
@@ -614,6 +626,9 @@ class MainActivity : AppCompatActivity() {
         appendLine("原尺度路径：${duration("route_original")}")
         appendLine("缩放路径：${duration("route_scaled")}")
         appendLine("旋转及镜像路径：${duration("route_rotation")}")
+        appendLine("八信号联合精定位准备：${duration("joint_signal_prepare")}")
+        appendLine("八信号联合拟合：${duration("joint_signal_fit")}")
+        appendLine("联合精定位候选解码：${duration("joint_geometry_decode")}")
         appendLine("角度候选头部精校准：${duration("angle_header_refinement")}")
         appendLine("角度候选正文解码及认证：${duration("angle_body_decode")}")
         appendLine("定位总耗时：${duration("locator_total")}")
