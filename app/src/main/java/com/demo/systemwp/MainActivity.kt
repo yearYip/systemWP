@@ -14,10 +14,14 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.text.Spannable
+import android.text.SpannableStringBuilder
+import android.text.style.ForegroundColorSpan
 import android.util.Log
 import android.view.Display
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
@@ -47,6 +51,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnToggle: Button
     private lateinit var tvResult: TextView
     private lateinit var tvParseElapsed: TextView
+    private lateinit var tvParseStep: TextView
+    private lateinit var tvParseSteps: TextView
+    private lateinit var progressParseSteps: ProgressBar
+    private var lastParseProgress: WatermarkParseProgress? = null
+    private val visitedParseStages = mutableSetOf<WatermarkParseProgress.Stage>()
+    private val skippedParseStages = mutableSetOf<WatermarkParseProgress.Stage>()
 
     private var startIssued = false
     private var parseJob: Job? = null
@@ -87,10 +97,15 @@ class MainActivity : AppCompatActivity() {
         btnToggle = findViewById(R.id.btn_toggle)
         tvResult = findViewById(R.id.tv_result)
         tvParseElapsed = findViewById(R.id.tv_parse_elapsed)
+        tvParseStep = findViewById(R.id.tv_parse_step)
+        tvParseSteps = findViewById(R.id.tv_parse_steps)
+        progressParseSteps = findViewById(R.id.progress_parse_steps)
+        progressParseSteps.max = WatermarkParseProgress.Stage.entries.size
         btnCancelParse = findViewById(R.id.btn_cancel_parse)
         btnCancelParse.setOnClickListener {
             parseJob?.cancel()
             finishParseTimer()
+            finishParseProgress()
             btnCancelParse.visibility = android.view.View.GONE
             tvResult.setText(R.string.parse_cancelled)
         }
@@ -226,9 +241,83 @@ class MainActivity : AppCompatActivity() {
 
     // ---------------------------------------------------------------- 水印解析
 
+    private fun stageTitle(stage: WatermarkParseProgress.Stage): String = getString(when (stage) {
+        WatermarkParseProgress.Stage.READ_IMAGE -> R.string.parse_step_read
+        WatermarkParseProgress.Stage.DIRECT_READ -> R.string.parse_step_direct
+        WatermarkParseProgress.Stage.HEADER_PROBE -> R.string.parse_step_probe
+        WatermarkParseProgress.Stage.SPECTRAL_LOCATION -> R.string.parse_step_spectral
+        WatermarkParseProgress.Stage.ORIGINAL_SEARCH -> R.string.parse_step_original
+        WatermarkParseProgress.Stage.SCALED_SEARCH -> R.string.parse_step_scaled
+        WatermarkParseProgress.Stage.ROTATION_SEARCH -> R.string.parse_step_rotation
+        WatermarkParseProgress.Stage.SCREEN_COMPENSATION -> R.string.parse_step_screen
+    })
+
+    private fun showParseProgress(progress: WatermarkParseProgress) {
+        val previous = lastParseProgress
+        if (previous == null || progress.frameIndex != previous.frameIndex) {
+            visitedParseStages.clear()
+            skippedParseStages.clear()
+        }
+        skippedParseStages.addAll(progress.skippedStages)
+        if (progress.stage == WatermarkParseProgress.Stage.SCREEN_COMPENSATION) {
+            skippedParseStages.addAll(WatermarkParseProgress.Stage.entries.filter {
+                it != progress.stage && it !in visitedParseStages
+            })
+        }
+        skippedParseStages.remove(progress.stage)
+        visitedParseStages.add(progress.stage)
+        lastParseProgress = progress
+        val title = stageTitle(progress.stage)
+        val frame = if (progress.frameIndex != null && progress.frameCount != null)
+            getString(R.string.processing_video, progress.frameIndex, progress.frameCount) + "\n" else ""
+        tvParseStep.visibility = android.view.View.VISIBLE
+        progressParseSteps.visibility = android.view.View.VISIBLE
+        val completedCount = visitedParseStages.size - 1 + skippedParseStages.count { it !in visitedParseStages }
+        tvParseStep.text = frame + getString(R.string.parse_step_progress,
+            completedCount, progressParseSteps.max, title)
+        val steps = SpannableStringBuilder()
+        for (stage in WatermarkParseProgress.Stage.entries) {
+            val (status, color) = when {
+                stage == progress.stage -> R.string.parse_step_running to R.color.parse_step_running
+                stage in visitedParseStages ->
+                    R.string.parse_step_completed to R.color.parse_step_completed
+                stage in skippedParseStages -> R.string.parse_step_skipped to R.color.parse_step_skipped
+                else -> R.string.parse_step_pending to R.color.parse_step_pending
+            }
+            if (steps.isNotEmpty()) steps.append('\n')
+            val start = steps.length
+            steps.append(getString(R.string.parse_step_item, stage.number, stageTitle(stage), getString(status)))
+            steps.setSpan(ForegroundColorSpan(ContextCompat.getColor(this, color)),
+                start, steps.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        tvParseSteps.text = steps
+        tvParseSteps.visibility = android.view.View.VISIBLE
+        progressParseSteps.setProgress(completedCount, false)
+        progressParseSteps.secondaryProgress = completedCount + 1
+        progressParseSteps.contentDescription = tvParseStep.text
+        tvResult.text = frame + progress.detail.ifBlank { title }
+    }
+
+    private fun finishParseProgress() {
+        tvParseStep.visibility = android.view.View.GONE
+        tvParseSteps.visibility = android.view.View.GONE
+        progressParseSteps.visibility = android.view.View.GONE
+        tvParseStep.text = ""
+        tvParseSteps.text = ""
+        progressParseSteps.progress = 0
+        progressParseSteps.secondaryProgress = 0
+        progressParseSteps.contentDescription = null
+        lastParseProgress = null
+        visitedParseStages.clear()
+        skippedParseStages.clear()
+    }
+
     /** 使用单调时钟独立刷新计时，不依赖后台算法发送进度的频率。 */
     private fun startParseTimer() {
         parseTimerJob?.cancel()
+        lastParseProgress = null
+        visitedParseStages.clear()
+        skippedParseStages.clear()
         val startedAt = SystemClock.elapsedRealtime()
         parseStartedAt = startedAt
         tvParseElapsed.visibility = android.view.View.VISIBLE
@@ -254,19 +343,21 @@ class MainActivity : AppCompatActivity() {
     private fun parseImage(uri: Uri) {
         parseJob?.cancel()
         startParseTimer()
+        showParseProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.READ_IMAGE))
         btnCancelParse.visibility = android.view.View.VISIBLE
         tvResult.setText(R.string.processing)
         parseJob = lifecycleScope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
                     decodeAndExtract(uri) { progress ->
-                        withContext(Dispatchers.Main) { tvResult.text = progress }
+                        withContext(Dispatchers.Main) { showParseProgress(progress) }
                     }
                 }
                 tvResult.text = result
             } finally {
                 if (parseJob == currentCoroutineContext()[Job]) {
                     finishParseTimer()
+                    finishParseProgress()
                     btnCancelParse.visibility = android.view.View.GONE
                 }
             }
@@ -276,13 +367,14 @@ class MainActivity : AppCompatActivity() {
     private fun parseVideo(uri: Uri) {
         parseJob?.cancel()
         startParseTimer()
+        showParseProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.READ_IMAGE))
         tvResult.setText(R.string.processing)
         btnCancelParse.visibility = android.view.View.VISIBLE
         parseJob = lifecycleScope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
                     decodeAndExtractVideo(uri) { progress ->
-                        withContext(Dispatchers.Main) { tvResult.text = progress }
+                        withContext(Dispatchers.Main) { showParseProgress(progress) }
                     }
                 }
                 tvResult.text = result
@@ -290,6 +382,7 @@ class MainActivity : AppCompatActivity() {
                 // 被新任务替换后，旧任务不能修改新任务的按钮状态。
                 if (parseJob == currentCoroutineContext()[Job]) {
                     finishParseTimer()
+                    finishParseProgress()
                     btnCancelParse.visibility = android.view.View.GONE
                 }
             }
@@ -299,7 +392,7 @@ class MainActivity : AppCompatActivity() {
     /** 短视频约每五秒取一帧，长视频均匀采样；找到首个通过认证的水印后停止。 */
     private suspend fun decodeAndExtractVideo(
         uri: Uri,
-        onProgress: suspend (String) -> Unit
+        onProgress: suspend (WatermarkParseProgress) -> Unit
     ): String {
         val retriever = MediaMetadataRetriever()
         try {
@@ -327,9 +420,14 @@ class MainActivity : AppCompatActivity() {
             var best: LocatedWatermarkCodec.Detection? = null
             var bestScale = 1.0
             val scaleSearch = WatermarkScaleSearch()
+            val timings = WatermarkTimings()
             for ((index, position) in positions.withIndex()) {
                 currentCoroutineContext().ensureActive()
-                onProgress(getString(R.string.processing_video, index + 1, positions.size))
+                suspend fun frameProgress(progress: WatermarkParseProgress) {
+                    onProgress(progress.copy(frameIndex = index + 1, frameCount = positions.size))
+                }
+                frameProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.READ_IMAGE,
+                    "正在读取视频帧…"))
                 val frame = try {
                     retriever.getFrameAtTime(position * 1_000, MediaMetadataRetriever.OPTION_CLOSEST)
                 } catch (e: Exception) {
@@ -349,14 +447,13 @@ class MainActivity : AppCompatActivity() {
                     }
                     decodedFrames++
                     val originalScale = 1.0
+                    frameProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.DIRECT_READ))
                     val original = detectDirectScreenWatermark(frame) { coroutine.ensureActive() }
                     if (original.payload != null) {
                         WatermarkScaleSearch.Result(original, originalScale)
                     } else {
                         scaleSearch.detect(frame, original, originalScale,
-                            onStage = { stage ->
-                                onProgress(getString(R.string.processing_video, index + 1, positions.size) + "\n" + stage)
-                            },
+                            onStage = { frameProgress(it) },
                             knownScaleFallback = {
                                 detectScreenSizeCompensation(frame, original) { coroutine.ensureActive() }
                             })
@@ -365,6 +462,7 @@ class MainActivity : AppCompatActivity() {
                     frame.recycle()
                 }
                 val detection = result.detection
+                timings.add(result.timings)
                 Log.i(LOG_TAG, "video position=${position}ms scale=${result.scale} " +
                     "status=${detection.status} score=${detection.score}")
                 val payload = detection.payload
@@ -377,8 +475,8 @@ class MainActivity : AppCompatActivity() {
                         appendLine("已解析帧数：$decodedFrames")
                         appendLine("抽帧缩放补偿比例：${formatScale(result.scale)}")
                         appendLine("水印格式：${detection.format}")
-                        if (detection.rotationDegrees != 0) {
-                            appendLine("旋转补偿：顺时针 ${detection.rotationDegrees}°")
+                        if (detection.rotationDegrees != 0.0) {
+                            appendLine("旋转补偿：顺时针 ${String.format(Locale.US, "%.3f", detection.rotationDegrees)}°")
                         }
                         if (detection.horizontalMirrored) appendLine("水平镜像补偿：已应用")
                         appendLine()
@@ -388,6 +486,7 @@ class MainActivity : AppCompatActivity() {
                         appendLine("时间戳：${formatTimestamp(payload.timestamp)}")
                         appendLine("已找到首个有效水印，停止抽帧。")
                         appendLine("（载荷由本机 Keystore 密钥加密，仅本机可解）")
+                        appendWatermarkTimings(timings, video = true)
                     }
                 }
                 val previous = best
@@ -417,11 +516,12 @@ class MainActivity : AppCompatActivity() {
                     }
                     appendLine("水印同步相关强度：${formatScore(best?.score ?: 0.0)}")
                     appendLine("最佳候选补偿比例：${formatScale(bestScale)}（未经认证）")
-                    appendLine("已对抽样帧尝试 W2 原尺度检测、缩放定位及头部校准。")
+                    appendLine("已对抽样帧按头部和频谱证据分流，并在预算内尝试原尺度、缩放或旋转解析。")
                     appendLine("比例搜索为有限候选搜索，不保证覆盖所有缩放或严重裁剪。")
                     appendLine("录屏压缩、缩放或裁剪可能削弱水印，建议使用原始高画质录屏。")
                     appendLine("结果仅覆盖抽样帧，不能据此判断整段视频不存在水印。")
                 }
+                appendWatermarkTimings(timings, video = true)
             }
         } catch (e: CancellationException) {
             throw e
@@ -444,12 +544,29 @@ class MainActivity : AppCompatActivity() {
 
     private fun formatScale(scale: Double): String = String.format(Locale.US, "%.4f", scale)
 
+    private fun StringBuilder.appendWatermarkTimings(timings: WatermarkTimings?, video: Boolean = false) {
+        appendLine()
+        appendLine(if (video) "定位阶段耗时（所有已解析帧累计）：" else "定位阶段耗时（所有候选累计）：")
+        fun duration(stage: String): String = timings?.milliseconds(stage)?.let {
+            String.format(Locale.US, "%.1f ms", it)
+        } ?: "未执行"
+        appendLine("角度估计：${duration("angle_estimation")}")
+        appendLine("原尺度头部预检：${duration("header_probe")}")
+        appendLine("原尺度路径：${duration("route_original")}")
+        appendLine("缩放路径：${duration("route_scaled")}")
+        appendLine("旋转及镜像路径：${duration("route_rotation")}")
+        appendLine("角度候选头部精校准：${duration("angle_header_refinement")}")
+        appendLine("角度候选正文解码及认证：${duration("angle_body_decode")}")
+        appendLine("定位总耗时：${duration("locator_total")}")
+        appendLine("（总耗时包含上述阶段及其他定位步骤，不含文件读取和默认位置检测）")
+    }
+
     private fun detectDirectScreenWatermark(
         bitmap: Bitmap,
         checkCancelled: () -> Unit
     ): LocatedWatermarkCodec.Detection = LocatedWatermarkCodec.detectDirect(bitmap, checkCancelled)
 
-    /** 解码整图（不缩放），因为盲水印的 LSB 位置依赖原始尺寸。 */
+    /** 按图片原始尺寸解码，避免额外重采样损伤屏幕暗水印。 */
     private fun decodeBitmap(uri: Uri): Bitmap? {
         val options = BitmapFactory.Options().apply {
             inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -459,7 +576,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 在原尺度/未知尺度两条路径均未认证后，保留设备显示尺寸补偿作为兼容路径。 */
+    /** 默认位置读取和频谱定位均未认证后，尝试设备显示尺寸补偿。 */
     private fun detectScreenSizeCompensation(
         bitmap: Bitmap,
         original: LocatedWatermarkCodec.Detection,
@@ -510,11 +627,13 @@ class MainActivity : AppCompatActivity() {
     }
     private suspend fun decodeAndExtract(
         uri: Uri,
-        onProgress: suspend (String) -> Unit
+        onProgress: suspend (WatermarkParseProgress) -> Unit
     ): String {
         return try {
             val coroutine = currentCoroutineContext()
             coroutine.ensureActive()
+            onProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.READ_IMAGE,
+                "正在读取待解析图片…"))
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             contentResolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it, null, bounds)
@@ -528,21 +647,19 @@ class MainActivity : AppCompatActivity() {
             val displayHeight = resources.displayMetrics.heightPixels
             val resampled = width != displayWidth || height != displayHeight
 
-            // 只解码一次，两种水印共用：屏幕暗水印（截屏）与 LSB 盲水印（图片文件）
+            // 只解码一次，供屏幕暗水印的直接读取和定位搜索使用。
             val bitmap = if (tooLarge) null else decodeBitmap(uri)
             try {
                 coroutine.ensureActive()
                 val originalScale = 1.0
                 val original = bitmap?.let {
+                    onProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.DIRECT_READ))
                     detectDirectScreenWatermark(it) { coroutine.ensureActive() }
                 }
                 coroutine.ensureActive()
-                // LSB 始终读取原图；已解析成功时无需再做耗时的屏幕水印比例搜索。
-                val lsbPayload = if (original?.payload == null) bitmap?.let { WatermarkCodec.extract(it) }
-                    else null
-                coroutine.ensureActive()
+                // 直接读取未通过认证时，再进行屏幕暗水印定位搜索。
                 val searched = bitmap != null && original != null &&
-                    original.payload == null && lsbPayload == null
+                    original.payload == null
                 val screenResult = if (searched && bitmap != null && original != null) {
                     WatermarkScaleSearch().detect(bitmap, original, originalScale,
                         onStage = onProgress,
@@ -578,18 +695,11 @@ class MainActivity : AppCompatActivity() {
                             appendLine("时间戳：${formatTimestamp(screenPayload.timestamp)}")
                             appendLine("图片缩放补偿比例：${formatScale(screenResult?.scale ?: originalScale)}")
                             appendLine("水印格式：${screenDetection?.format.orEmpty()}")
-                            if (screenDetection != null && screenDetection.rotationDegrees != 0) {
-                                appendLine("旋转补偿：顺时针 ${screenDetection.rotationDegrees}°")
+                            if (screenDetection != null && screenDetection.rotationDegrees != 0.0) {
+                                appendLine("旋转补偿：顺时针 ${String.format(Locale.US, "%.3f", screenDetection.rotationDegrees)}°")
                             }
                             if (screenDetection?.horizontalMirrored == true) appendLine("水平镜像补偿：已应用")
                             appendLine("（载荷由本机 Keystore 密钥加密，仅本机可解）")
-                        }
-
-                        lsbPayload != null -> {
-                            val (u, d) = parsePayload(lsbPayload)
-                            appendLine("检测到图片盲水印：")
-                            appendLine("用户名：$u")
-                            appendLine("设备 ID：$d")
                         }
 
                         else -> {
@@ -615,7 +725,7 @@ class MainActivity : AppCompatActivity() {
                             if (searched) {
                                 appendLine("最佳候选水印格式：${screenDetection?.format.orEmpty()}")
                                 appendLine("最佳候选补偿比例：${formatScale(screenResult?.scale ?: 1.0)}（未经认证）")
-                                appendLine("已尝试 W2 原尺度检测、缩放定位及头部校准；仍可能因裁剪或信号损伤失败。")
+                                appendLine("已按头部和频谱证据分流，在预算内尝试候选路径；仍可能因裁剪或信号损伤失败。")
                             }
                             if (resampled) appendLine(
                                 "图片尺寸与当前屏幕不同，已优先按原图解析，并尝试适用的等比缩放。"
@@ -625,6 +735,7 @@ class MainActivity : AppCompatActivity() {
                             )
                         }
                     }
+                    appendWatermarkTimings(screenResult?.timings)
                 }
             } finally {
                 bitmap?.recycle()
@@ -636,11 +747,6 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             "解析失败：${e.message}"
         }
-    }
-
-    private fun parsePayload(payload: String): Pair<String, String> {
-        val lines = payload.lines()
-        return (lines.getOrNull(0).orEmpty()) to (lines.getOrNull(1).orEmpty())
     }
 
     private fun formatTimestamp(millis: Long): String =
@@ -671,7 +777,7 @@ class MainActivity : AppCompatActivity() {
         /** 输入停顿多久后提交身份变更，避免每敲一个字就重建水印。 */
         private const val IDENTITY_COMMIT_DELAY_MS = 400L
 
-        /** 超过该像素数不整图解码，避免 OOM（盲水印提取要求原尺寸，故仅提示）。 */
+        /** 超过该像素数跳过整图解码与提取，避免内存不足。 */
         private const val MAX_DECODE_PIXELS = 20_000_000L
         private const val VIDEO_FRAME_INTERVAL_MS = 5_000L
         private const val MAX_VIDEO_FRAMES = 120

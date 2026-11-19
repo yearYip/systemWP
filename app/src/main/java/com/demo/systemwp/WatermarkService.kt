@@ -152,7 +152,7 @@ class WatermarkService : Service() {
     }
 
     /**
-     * 全屏暗水印：由 [LocatedWatermarkCodec] 生成正文棋盘及分散的双频定位信号。
+     * 全屏暗水印：由 [LocatedWatermarkCodec] 生成正文棋盘及多方向频谱定位模板。
      * 继续复用低透明度 shader 平铺，不在每个显示帧执行编码或定位计算。
      *
      * 用户名/设备 ID 变化时在下一帧重建 tile；身份未变时每分钟更新时间戳。

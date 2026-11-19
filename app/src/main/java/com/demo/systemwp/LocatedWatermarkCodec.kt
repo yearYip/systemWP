@@ -3,15 +3,18 @@ package com.demo.systemwp
 import android.graphics.Bitmap
 import android.graphics.BitmapShader
 import android.graphics.Shader
+import android.os.SystemClock
 import android.util.Log
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
-import kotlin.math.roundToInt
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.PI
 
-/** 定位版屏幕水印。R/B 通道承载横/纵向双频定位信号，G 通道承载正文。
+/** 定位版屏幕水印。R/B 通道承载多方向频谱定位模板，G 通道承载正文。
  * 分离通道避免定位标识挤占正文槽位；所有通道仍使用同一个低透明度悬浮层。
  * 正文使用 6 像素周期、空间交织和扩展 Hamming 码，认证规则及密钥不变。
  */
@@ -32,7 +35,7 @@ object LocatedWatermarkCodec {
         val bodyBitsRequired: Int = 0,
         val format: String = "定位版 W2",
         val horizontalMirrored: Boolean = false,
-        val rotationDegrees: Int = 0
+        val rotationDegrees: Double = 0.0
     )
 
     fun createShader(tile: Bitmap): BitmapShader =
@@ -47,6 +50,24 @@ object LocatedWatermarkCodec {
     private const val MAGIC = 0x5732 // W2
     private const val FORMAT = "定位版 W2"
     private val nextRunId = AtomicLong()
+
+    private class SearchLimitReached : RuntimeException()
+
+    /** 每条路径独立限时；预算耗尽仅结束当前路径，用户取消仍向外传播。 */
+    private class SearchBudget(milliseconds: Long, private val checkCancelled: () -> Unit) {
+        val deadline = SystemClock.elapsedRealtimeNanos() + milliseconds * 1_000_000
+        fun check() {
+            checkCancelled()
+            if (SystemClock.elapsedRealtimeNanos() >= deadline) throw SearchLimitReached()
+        }
+        fun remainingMs(): Long = maxOf(0, (deadline - SystemClock.elapsedRealtimeNanos()) / 1_000_000)
+    }
+
+    private enum class Route(val stage: WatermarkParseProgress.Stage, val budgetMs: Long) {
+        ORIGINAL(WatermarkParseProgress.Stage.ORIGINAL_SEARCH, 2500),
+        SCALED(WatermarkParseProgress.Stage.SCALED_SEARCH, 3500),
+        ROTATION(WatermarkParseProgress.Stage.ROTATION_SEARCH, 6500)
+    }
 
     // 997 与 3136 互质：一一映射，连续位和重复副本分散到不同位置。
     private fun physical(logical: Int): Int = (logical * 997 + 313) % SLOTS
@@ -67,16 +88,14 @@ object LocatedWatermarkCodec {
         }
         for (r in 0 until HEADER_REPEAT) for (bit in header.indices) put(r * HEADER_BITS + bit, header[bit])
         for (r in 0 until repeat) for (bit in body.indices) put(HEADER_SLOTS + r * body.size + bit, body[bit])
-        val pilots = IntArray(WatermarkLocator.TILE) {
-            (128.0 + WatermarkLocator.signal(it + 0.5)).roundToInt().coerceIn(0, 255)
-        }
         val pixels = IntArray(WatermarkLocator.TILE * WatermarkLocator.TILE)
         for (y in 0 until WatermarkLocator.TILE) for (x in 0 until WatermarkLocator.TILE) {
             val slot = y / CHIP * SIDE + x / CHIP
             val carrier = if ((x / 3 + y / 3) % 2 == 0) 1 else -1
             val green = if (carrier * signs[slot] > 0) 255 else 0
             pixels[y * WatermarkLocator.TILE + x] =
-                (255 shl 24) or (pilots[x] shl 16) or (green shl 8) or pilots[y]
+                (255 shl 24) or (WatermarkSpectralTemplate.redPixel(x, y) shl 16) or
+                    (green shl 8) or WatermarkSpectralTemplate.bluePixel(x, y)
         }
         return Bitmap.createBitmap(pixels, WatermarkLocator.TILE, WatermarkLocator.TILE, Bitmap.Config.ARGB_8888)
     }
@@ -104,7 +123,22 @@ object LocatedWatermarkCodec {
     suspend fun detectLocated(
         bitmap: Bitmap,
         checkCancelled: () -> Unit,
-        onProgress: suspend (String) -> Unit
+        onProgress: suspend (WatermarkParseProgress) -> Unit,
+        timings: WatermarkTimings? = null
+    ): WatermarkScaleSearch.Result? {
+        val started = SystemClock.elapsedRealtimeNanos()
+        try {
+            return detectLocatedInternal(bitmap, checkCancelled, onProgress, timings)
+        } finally {
+            timings?.record("locator_total", (SystemClock.elapsedRealtimeNanos() - started) / 1_000_000.0)
+        }
+    }
+
+    private suspend fun detectLocatedInternal(
+        bitmap: Bitmap,
+        checkCancelled: () -> Unit,
+        onProgress: suspend (WatermarkParseProgress) -> Unit,
+        timings: WatermarkTimings?
     ): WatermarkScaleSearch.Result? {
         val runId = nextRunId.incrementAndGet()
         fun diagnostic(message: String) {
@@ -116,143 +150,148 @@ object LocatedWatermarkCodec {
             return null
         }
         val normalImage = Image(bitmap)
-        data class Direction(val image: Image, val probe: Image.UnscaledProbe, val label: String)
-        val orientations = (0..3).flatMap { rotation ->
-            val image = normalImage.rotated(rotation)
-            val label = "顺时针旋转 ${rotation * 90}°"
-            listOf(image to label, image.mirrored() to "$label + 水平镜像补偿")
-        }
-        val directions = orientations.map { (image, label) ->
-            checkCancelled()
-            onProgress("正在预检方向：$label")
-            val probe = image.probeUnscaled(checkCancelled) { diagnostic("direction=$label $it") }
-            Direction(image, probe, label)
-        }.sortedWith(compareByDescending<Direction> { it.probe.strong }.thenByDescending { it.probe.confidence })
-        diagnostic("orientation order=${directions.joinToString { it.label }} " +
-            "confidence=${directions.joinToString { "${it.label}:${it.probe.confidence}" }}")
+        val startedAt = SystemClock.elapsedRealtimeNanos()
+        fun elapsedMs() = (SystemClock.elapsedRealtimeNanos() - startedAt) / 1_000_000.0
         var best: WatermarkScaleSearch.Result? = null
-        for ((index, direction) in directions.withIndex()) {
-            checkCancelled()
-            diagnostic("orientation attempt=${index + 1}/${directions.size} direction=${direction.label}")
-            val result = detectDirection(direction.image, direction.probe, checkCancelled,
-                onProgress = { progress ->
-                    onProgress("解析方向：${direction.label}（${index + 1} / ${directions.size}）\n$progress")
-                }, diagnostic = { diagnostic("direction=${direction.label} $it") })
-            if (result != null) {
-                val previous = best
-                if (previous == null || better(result.detection, previous.detection)) best = result
-                if (result.detection.payload != null) {
-                    diagnostic("orientation complete reason=success rotationDegrees=${result.detection.rotationDegrees} " +
-                        "horizontalMirrored=${result.detection.horizontalMirrored}")
-                    return result
+        fun remember(result: WatermarkScaleSearch.Result?) {
+            if (result != null && (best == null || better(result.detection, requireNotNull(best).detection))) best = result
+        }
+        onProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.HEADER_PROBE,
+            "正在预检原尺度固定头部，判断是否优先搜索裁剪位置…"))
+        val probeBudget = SearchBudget(1500, checkCancelled)
+        val probe = measured("header_probe", ::diagnostic, timings) {
+            normalImage.probeHeader(probeBudget, ::diagnostic)
+        }
+        val attempted = mutableSetOf<Route>()
+        val skipped = mutableSetOf<WatermarkParseProgress.Stage>()
+        var angles = emptyList<WatermarkAngleEstimator.Candidate>()
+        suspend fun runRoute(route: Route) {
+            if (!attempted.add(route)) return
+            val budget = SearchBudget(route.budgetMs, checkCancelled)
+            diagnostic("route start=$route budgetMs=${route.budgetMs}")
+            suspend fun report(detail: String) {
+                onProgress(WatermarkParseProgress(route.stage, detail, skippedStages = skipped.toSet()))
+            }
+            measured("route_${route.name.lowercase()}", ::diagnostic, timings) {
+                try {
+                    when (route) {
+                        Route.ORIGINAL -> {
+                            report("原尺度路径：按固定头部搜索裁剪偏移…")
+                            remember(normalImage.decodePositions(probe.positions, false, budget, timings, ::diagnostic))
+                            if (best?.detection?.payload == null) {
+                                val positions = normalImage.searchHeaderPositions(1.0, 1, budget, 1400, ::diagnostic)
+                                remember(normalImage.decodePositions(positions, false, budget, timings, ::diagnostic))
+                            }
+                        }
+                        Route.SCALED -> {
+                            report("无旋转缩放路径：估计比例并搜索裁剪偏移…")
+                            val axis = normalImage.locateAxes(budget::check, ::diagnostic)
+                            val scales = (angles.filter { nearZero(it.degrees) && !it.mirrored }.map { it.scale } +
+                                axis.map { it.x.scale }).filter { abs(it - 1.0) > 0.001 }
+                                .fold(mutableListOf<Double>()) { result, scale ->
+                                    if (result.none { abs(it - scale) < 0.002 }) result.add(scale)
+                                    result
+                                }.take(3)
+                            for ((index, scale) in scales.withIndex()) {
+                                report("无旋转缩放路径：候选 ${index + 1}/${scales.size}，校准比例和位置…")
+                                val seeds = axis.filter { abs(it.x.scale - scale) < 0.025 }.take(2).map {
+                                    Image.Geometry(scale, it.x.offset, it.y.offset, 0.0)
+                                }
+                                remember(normalImage.decodePositions(seeds, true, budget, timings, ::diagnostic))
+                                if (best?.detection?.payload != null) break
+                                for (delta in doubleArrayOf(0.0, -1.0 / bitmap.width, 1.0 / bitmap.width)) {
+                                    val adjusted = scale + delta
+                                    if (adjusted !in 0.45..1.10) continue
+                                    val positions = normalImage.searchHeaderPositions(adjusted, 2, budget, 700, ::diagnostic)
+                                    remember(normalImage.decodePositions(positions, true, budget, timings, ::diagnostic))
+                                    if (best?.detection?.payload != null) break
+                                }
+                                if (best?.detection?.payload != null) break
+                            }
+                        }
+                        Route.ROTATION -> {
+                            rotationLoop@ for ((index, angle) in angles.take(4).withIndex()) {
+                                for (halfTurn in 0..1) for (mirror in listOf(angle.mirrored, !angle.mirrored)) {
+                                    budget.check()
+                                    val degrees = (angle.degrees + halfTurn * 180 + 360) % 360
+                                    val rotated = normalImage.atAngle(degrees)
+                                    val image = if (mirror) rotated.mirrored() else rotated
+                                    val label = "${"%.2f".format(java.util.Locale.US, degrees)}° 镜像=$mirror"
+                                    report("旋转路径：候选 ${index + 1}/${angles.size}，$label，联合校准并认证…")
+                                    val result = measured("angle_alignment direction=$label", ::diagnostic) {
+                                        image.detectEstimated(angle.scale, budget, timings) { diagnostic("angle=$label $it") }
+                                    }
+                                    remember(result)
+                                    if (best?.detection?.payload != null) break@rotationLoop
+                                }
+                            }
+                        }
+                    }
+                } catch (_: SearchLimitReached) {
+                    diagnostic("route complete=$route reason=time_budget")
                 }
             }
-            diagnostic("orientation fallback reason=not_authenticated direction=${direction.label}")
+            diagnostic("route complete=$route authenticated=${best?.detection?.payload != null}")
         }
-        diagnostic("orientation complete reason=no_authenticated_direction")
-        return best
-    }
-
-    private suspend fun detectDirection(
-        image: Image,
-        probe: Image.UnscaledProbe,
-        checkCancelled: () -> Unit,
-        onProgress: suspend (String) -> Unit,
-        diagnostic: (String) -> Unit
-    ): WatermarkScaleSearch.Result? {
-        var best: WatermarkScaleSearch.Result? = null
-        var unscaledTried = false
-
-        suspend fun tryUnscaled(): WatermarkScaleSearch.Result? {
-            checkCancelled()
-            unscaledTried = true
-            onProgress("正在验证原尺寸水印…")
-            // 优先完成预检找到的位置，认证失败才进入完整的原尺度位置搜索。
-            val seeded = image.completeUnscaledProbe(probe, checkCancelled, diagnostic)
-            if (seeded != null) {
-                val result = WatermarkScaleSearch.Result(seeded, 1.0)
-                val previous = best
-                if (previous == null || better(seeded, previous.detection)) best = result
-                if (seeded.payload != null) return result
-            }
-            val detection = image.detectUnscaled(checkCancelled, onProgress, diagnostic)
-            if (detection != null) {
-                val result = WatermarkScaleSearch.Result(detection, 1.0)
-                val previous = best
-                if (previous == null || better(detection, previous.detection)) best = result
-                if (detection.payload != null) return result
-            }
-            return null
-        }
-
+        // 头部证据强时直接验证原尺度位置，成功即可省去整个 FFT。
         if (probe.strong) {
-            diagnostic("route first=unscaled reason=strong_unscaled_header")
-            tryUnscaled()?.let { return it }
-            diagnostic("route fallback=scaled reason=unscaled_not_authenticated")
-        }
-        onProgress("正在搜索水印定位信号…")
-        val projections = image.projections(checkCancelled)
-        val candidates = WatermarkLocator.locateJoint(projections.first, projections.second, checkCancelled, diagnostic)
-        if (!unscaledTried) {
-            val clearScaledSignal = candidates.any {
-                abs(it.x.scale - 1.0) >= 0.01 && it.score >= 0.3 && minOf(it.x.score, it.y.score) >= 0.15
-            }
-            // 仅用相关运算数估计相对成本，不把它当作设备上的实际耗时。
-            val unscaledCost = 144L * SLOTS * magicSlots.size
-            val scaledCost = if (candidates.isEmpty()) Long.MAX_VALUE
-                else candidates.size * 9L * 36 * SLOTS * coarseMagicIndices.size
-            val scaledFirst = clearScaledSignal || scaledCost < unscaledCost
-            val reason = when {
-                clearScaledSignal -> "strong_scaled_pilot"
-                scaledFirst -> "ambiguous_lower_scaled_cost"
-                else -> "ambiguous_lower_unscaled_cost"
-            }
-            diagnostic("route first=${if (scaledFirst) "scaled" else "unscaled"} reason=$reason " +
-                "unscaledCorrelationOps=$unscaledCost scaledCorrelationOps=$scaledCost")
-            if (!scaledFirst) {
-                tryUnscaled()?.let { return it }
-                diagnostic("route fallback=scaled reason=unscaled_not_authenticated")
+            runRoute(Route.ORIGINAL)
+            if (best?.detection?.payload != null) {
+                diagnostic("orientation complete reason=original_success totalMs=${elapsedMs()}")
+                return best
             }
         }
-        for ((index, candidate) in candidates.withIndex()) {
-            checkCancelled()
-            val x = candidate.x
-            val y = candidate.y
-            val pairDetails = "joint candidate=${index + 1} scale=${x.scale} " +
-                "scoreX=${x.score} scoreY=${y.score} jointScore=${candidate.score}"
-            onProgress("正在处理候选 ${index + 1} / ${candidates.size}：对齐并验证…")
-            val scale = (x.scale + y.scale) / 2.0
-            diagnostic("geometry sx=${x.scale} sy=${y.scale} " +
-                "x=${x.offset} y=${y.offset} scoreX=${x.score} scoreY=${y.score}")
-            val calibrated = image.calibrateHeader(scale, checkCancelled,
-                onProgress = { progress ->
-                    onProgress("正在处理候选 ${index + 1} / ${candidates.size}\n$progress")
-                }) {
-                diagnostic("candidate=${index + 1} $it")
+        onProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.SPECTRAL_LOCATION,
+            "正在估计角度和比例，选择原尺度、缩放或旋转路径…"))
+        angles = measured("angle_estimation", ::diagnostic, timings) {
+            WatermarkAngleEstimator.estimate(normalImage.pixels, bitmap.width, bitmap.height,
+                checkCancelled, ::diagnostic)
+        }
+        val strongest = angles.firstOrNull()?.takeIf { it.score >= 0.04 }
+        val order = when {
+            strongest == null -> listOf(Route.ORIGINAL, Route.SCALED, Route.ROTATION)
+            !nearZero(strongest.degrees) || strongest.mirrored -> listOf(Route.ROTATION, Route.SCALED, Route.ORIGINAL)
+            abs(strongest.scale - 1.0) >= 0.01 -> listOf(Route.SCALED, Route.ORIGINAL, Route.ROTATION)
+            else -> listOf(Route.ORIGINAL, Route.SCALED, Route.ROTATION)
+        }
+        diagnostic("routing headerStrong=${probe.strong} order=${order.joinToString()} " +
+            "angle=${strongest?.degrees} scale=${strongest?.scale} mirror=${strongest?.mirrored}")
+        for (route in order) {
+            if (route == Route.ROTATION && angles.isEmpty()) {
+                skipped.add(route.stage)
+                continue
             }
-            if (calibrated != null) {
-                val previous = best
-                if (previous == null || better(calibrated.detection, previous.detection)) best = calibrated
-                if (calibrated.detection.payload != null) {
-                    diagnostic("complete reason=success stage=header_calibration $pairDetails " +
-                        "calibratedScale=${calibrated.scale}")
-                    return calibrated
-                }
+            runRoute(route)
+            if (best?.detection?.payload != null) {
+                diagnostic("orientation complete reason=${route.name.lowercase()}_success totalMs=${elapsedMs()}")
+                return best
             }
         }
-        if (!unscaledTried) {
-            diagnostic("route fallback=unscaled reason=scaled_not_authenticated")
-            tryUnscaled()?.let { return it }
-        }
-        val reason = if (candidates.isEmpty()) "no_joint_scale_candidates" else "all_decode_attempts_failed"
-        diagnostic("complete reason=$reason jointCandidates=${candidates.size} " +
-            "bestStatus=${best?.detection?.status}")
+        diagnostic("orientation complete reason=no_authenticated_route totalMs=${elapsedMs()}")
         return best
     }
+
+    private fun nearZero(degrees: Double): Boolean = abs((degrees + 540) % 360 - 180) <= 0.35
 
     internal fun better(a: Detection, b: Detection): Boolean =
         a.payload != null || a.status.ordinal > b.status.ordinal ||
             (a.status == b.status && a.score > b.score)
+
+    private inline fun <T> measured(
+        stage: String,
+        diagnostic: (String) -> Unit,
+        timings: WatermarkTimings? = null,
+        block: () -> T
+    ): T {
+        val started = SystemClock.elapsedRealtimeNanos()
+        try {
+            return block()
+        } finally {
+            val elapsedMs = (SystemClock.elapsedRealtimeNanos() - started) / 1_000_000.0
+            timings?.record(stage, elapsedMs)
+            diagnostic("timing stage=$stage elapsedMs=$elapsedMs")
+        }
+    }
 
     private class Samples(val sums: DoubleArray, val weights: DoubleArray)
 
@@ -261,30 +300,61 @@ object LocatedWatermarkCodec {
     private val magicSigns = IntArray(magicSlots.size) {
         WatermarkBits.pnSign(magicSlots[it]) * if (magicBits[it % 16] == 1) 1 else -1
     }
-    private val shiftedCoordinates = Array(SIDE) { shift -> IntArray(SIDE) { Math.floorMod(it - shift, SIDE) } }
-    // 粗定位使用每个 magic bit 的四份空间分散副本；精校准再读取全部 16 份。
-    private val coarseMagicIndices = IntArray(64) { it / 16 * 64 + it % 16 }
     private val isMagicSlot = BooleanArray(SLOTS).also { mask -> magicSlots.forEach { mask[it] = true } }
+    private val shiftedCoordinates = Array(SIDE) { shift -> IntArray(SIDE) { Math.floorMod(it - shift, SIDE) } }
+    private val coarseMagicIndices = IntArray(64) { it / 16 * 64 + it % 16 }
 
     private class Image private constructor(
         val sourceWidth: Int,
         val sourceHeight: Int,
         val pixels: IntArray,
         val horizontalMirrored: Boolean,
-        val quarterTurns: Int
+        val quarterTurns: Int,
+        val arbitraryDegrees: Double? = null
     ) {
         constructor(bitmap: Bitmap) : this(bitmap.width, bitmap.height,
             IntArray(bitmap.width * bitmap.height).also {
                 bitmap.getPixels(it, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
             }, false, 0)
 
-        val width: Int get() = if (quarterTurns % 2 == 0) sourceWidth else sourceHeight
-        val height: Int get() = if (quarterTurns % 2 == 0) sourceHeight else sourceWidth
+        private val radians = (arbitraryDegrees ?: 0.0) * PI / 180
+        private val rotationCos = cos(radians)
+        private val rotationSin = sin(radians)
+        val width: Int = if (arbitraryDegrees != null)
+            ceil(abs(rotationCos) * sourceWidth + abs(rotationSin) * sourceHeight).toInt()
+            else if (quarterTurns % 2 == 0) sourceWidth else sourceHeight
+        val height: Int = if (arbitraryDegrees != null)
+            ceil(abs(rotationSin) * sourceWidth + abs(rotationCos) * sourceHeight).toInt()
+            else if (quarterTurns % 2 == 0) sourceHeight else sourceWidth
 
-        // 两个方向只共享不可变像素；相位缓存独立，避免混用方向不同的采样。
-        fun mirrored(): Image = Image(sourceWidth, sourceHeight, pixels, !horizontalMirrored, quarterTurns)
+        // 各方向共享不可变像素，位置和投影缓存各自独立。
+        fun mirrored(): Image = Image(sourceWidth, sourceHeight, pixels, !horizontalMirrored, quarterTurns, arbitraryDegrees)
 
         fun rotated(turns: Int): Image = Image(sourceWidth, sourceHeight, pixels, false, turns)
+
+        fun atAngle(degrees: Double): Image = Image(sourceWidth, sourceHeight, pixels, false, 0, degrees)
+
+        private fun sourceX(x: Double, y: Double): Double {
+            val vx = (if (horizontalMirrored) width - 1 - x else x) - (width - 1) / 2.0
+            return rotationCos * vx + rotationSin * (y - (height - 1) / 2.0) + (sourceWidth - 1) / 2.0
+        }
+
+        private fun sourceY(x: Double, y: Double): Double {
+            val vx = (if (horizontalMirrored) width - 1 - x else x) - (width - 1) / 2.0
+            return -rotationSin * vx + rotationCos * (y - (height - 1) / 2.0) + (sourceHeight - 1) / 2.0
+        }
+
+        // 范围外返回 NaN，缺失区域不作为黑色像素参与定位或比特统计。
+        private fun channel(x: Double, y: Double, shift: Int): Double {
+            val sx = sourceX(x, y)
+            val sy = sourceY(x, y)
+            if (sx < 0 || sy < 0 || sx >= sourceWidth - 1 || sy >= sourceHeight - 1) return Double.NaN
+            val ix = floor(sx).toInt(); val iy = floor(sy).toInt()
+            val fx = sx - ix; val fy = sy - iy
+            fun at(dx: Int, dy: Int) = ((pixels[(iy + dy) * sourceWidth + ix + dx] ushr shift) and 255).toDouble()
+            return (at(0, 0) * (1 - fx) + at(1, 0) * fx) * (1 - fy) +
+                (at(0, 1) * (1 - fx) + at(1, 1) * fx) * fy
+        }
 
         // 先顺时针旋转，再在旋转后的坐标中应用水平镜像；整数坐标映射不插值。
         private fun pixelAt(column: Int, row: Int): Int {
@@ -299,116 +369,68 @@ object LocatedWatermarkCodec {
             return pixels[index]
         }
 
-        private data class CropCandidate(val phaseX: Int, val phaseY: Int, val chipX: Int, val chipY: Int,
-                                         val score: Double, val samples: Samples)
-
         data class Geometry(val scale: Double, val x: Double, val y: Double, val score: Double)
         private data class HeaderEvidence(val score: Double, val matchingBits: Int, val observedSlots: Int,
                                           val coherence: Double)
-        data class UnscaledProbe(val positions: List<Geometry>, val strong: Boolean, val confidence: Double)
-        // 预检与完整原尺度搜索共用采样，避免再次读取同一像素相位。
-        private val unscaledPhaseSamples = arrayOfNulls<Samples>(CHIP * CHIP)
+        data class HeaderProbe(val positions: List<Geometry>, val strong: Boolean)
+        private val originalPhaseCandidates = arrayOfNulls<List<Geometry>>(CHIP * CHIP)
+        private var axisCandidates: List<WatermarkLocator.Candidate>? = null
 
-        fun probeUnscaled(checkCancelled: () -> Unit, diagnostic: (String) -> Unit): UnscaledProbe {
-            val positions = searchHeaderPositions(1.0, checkCancelled)
-            val measured = positions.map { it to headerEvidence(it, checkCancelled) }
-                .sortedByDescending { it.second.score }
-            val strongest = measured.firstOrNull()?.second
-            val strong = strongest != null && strongest.score >= 0.3 && strongest.matchingBits >= 14 &&
-                strongest.observedSlots >= 128 && strongest.coherence >= 0.25
-            val confidence = max(0.0, strongest?.score ?: 0.0) *
-                max(0.0, strongest?.coherence ?: 0.0) * ((strongest?.matchingBits ?: 0) / 16.0)
-            diagnostic("probe scale=1.0 phases=36 coarseMagicSlots=64 positions=${positions.size} " +
-                "score=${strongest?.score} magicMatches=${strongest?.matchingBits}/16 " +
-                "magicSlots=${strongest?.observedSlots}/256 coherence=${strongest?.coherence} " +
-                "strong=$strong confidence=$confidence")
-            // 只检查已知 magic，不读取长度、正文，也不在预检阶段执行认证。
-            return UnscaledProbe(measured.map { (geometry, evidence) -> geometry.copy(score = evidence.score) }, strong, confidence)
-        }
-
-        fun completeUnscaledProbe(probe: UnscaledProbe, checkCancelled: () -> Unit,
-                                  diagnostic: (String) -> Unit): Detection? {
-            var best: Detection? = null
-            for ((index, position) in probe.positions.withIndex()) {
-                checkCancelled()
-                val geometry = refineHeader(position, checkCancelled, adjustScale = false)
-                val detection = inspect(1.0, 1.0, geometry.x, geometry.y, checkCancelled)
-                diagnostic("unscaled probeCandidate=${index + 1} scale=1.0 offsetX=${geometry.x} " +
-                    "offsetY=${geometry.y} status=${detection.status} score=${detection.score}")
-                val previous = best
-                if (previous == null || better(detection, previous)) best = detection
-                if (detection.payload != null) {
-                    diagnostic("complete reason=success stage=unscaled source=probe scale=1.0")
-                    return detection
-                }
-            }
-            return best
-        }
-
-        /** 频谱只提供尺度初值；位置及最终尺度由已知 magic 的真实 G 通道信号校准。
-         * 整数恢复宽度保留相邻值，连续采样避免再次缩放 bitmap 引入插值。
-         */
-        suspend fun calibrateHeader(
-            estimatedScale: Double,
-            checkCancelled: () -> Unit,
-            onProgress: suspend (String) -> Unit,
-            diagnostic: (String) -> Unit
-        ): WatermarkScaleSearch.Result? {
-            val centerWidth = (width * estimatedScale).roundToInt()
-            val widths = (listOf(0) + (1..4).flatMap { listOf(-it, it) })
-                .map { centerWidth + it }
-                .filter { it >= 64 && it.toDouble() / width in 0.45..1.10 }
-            diagnostic("calibration start estimatedScale=$estimatedScale centerWidth=$centerWidth " +
-                "widths=${widths.joinToString()} phaseStep=2 coarseMagicSlots=64")
-            var best: WatermarkScaleSearch.Result? = null
-            var attempts = 0
-            for ((index, restoredWidth) in widths.withIndex()) {
-                checkCancelled()
-                val scale = restoredWidth.toDouble() / width
-                onProgress("正在用水印头部校准比例和位置：${index + 1} / ${widths.size}")
-                val positions = searchHeaderPositions(scale, checkCancelled)
-                diagnostic("calibration width=$restoredWidth scale=$scale positions=${positions.size} " +
-                    "coarseScore=${positions.firstOrNull()?.score}")
-                // 每个恢复宽度独立保留位置，不让错误宽度的高分提前淘汰相邻宽度。
+        fun probeHeader(budget: SearchBudget, diagnostic: (String) -> Unit): HeaderProbe {
+            var positions = emptyList<Geometry>()
+            var strong = false
+            try {
+                positions = searchHeaderPositions(1.0, 2, budget, 900, diagnostic)
                 for (position in positions) {
-                    val geometry = refineHeader(position, checkCancelled)
-                    val evidence = headerEvidence(geometry, checkCancelled)
-                    val detection = inspect(geometry.scale, geometry.scale, geometry.x, geometry.y, checkCancelled)
-                    val result = WatermarkScaleSearch.Result(detection, geometry.scale)
-                    attempts++
-                    diagnostic("calibration attempt=$attempts restoredWidth=$restoredWidth " +
-                        "scale=${geometry.scale} offsetX=${geometry.x} offsetY=${geometry.y} " +
-                        "coarseScore=${position.score} headerScore=${evidence.score} " +
-                        "magicMatches=${evidence.matchingBits}/16 magicSlots=${evidence.observedSlots}/256 " +
-                        "status=${detection.status} header=${detection.headerBitsObserved}/32 " +
-                        "body=${detection.bodyBitsObserved}/${detection.bodyBitsRequired}")
-                    val previous = best
-                    if (previous == null || better(detection, previous.detection)) best = result
-                    if (detection.payload != null) {
-                        diagnostic("calibration complete reason=success attempts=$attempts scale=${geometry.scale}")
-                        return result
-                    }
+                    budget.check()
+                    val evidence = headerEvidence(position, budget::check)
+                    if (evidence.score >= 0.3 && evidence.matchingBits >= 14 &&
+                        evidence.observedSlots >= 128 && evidence.coherence >= 0.25) strong = true
+                    diagnostic("header_probe score=${evidence.score} matches=${evidence.matchingBits}/16 " +
+                        "slots=${evidence.observedSlots}/256 coherence=${evidence.coherence}")
                 }
+            } catch (_: SearchLimitReached) {
+                diagnostic("header_probe reason=time_budget")
             }
-            diagnostic("calibration complete reason=no_authenticated_candidate attempts=$attempts " +
-                "bestStatus=${best?.detection?.status}")
-            return best
+            diagnostic("header_probe positions=${positions.size} strong=$strong")
+            return HeaderProbe(positions, strong)
         }
 
-        private fun searchHeaderPositions(scale: Double, checkCancelled: () -> Unit): List<Geometry> {
+        /** 缓存每个原尺度相位的位置候选，后续搜索复用预检已完成的相关计算。 */
+        fun searchHeaderPositions(scale: Double, phaseStep: Int, budget: SearchBudget,
+                                  searchMs: Long, diagnostic: (String) -> Unit): List<Geometry> {
+            val deadline = minOf(budget.deadline - 200_000_000,
+                SystemClock.elapsedRealtimeNanos() + searchMs * 1_000_000)
             val strongest = ArrayList<Geometry>()
-            for (py in 0 until CHIP step 2) for (px in 0 until CHIP step 2) {
-                checkCancelled()
-                val samples = if (scale == 1.0) {
-                    val key = py * CHIP + px
-                    unscaledPhaseSamples[key] ?: sample(scale, scale, px.toDouble(), py.toDouble(), checkCancelled)
-                        .also { unscaledPhaseSamples[key] = it }
-                } else sample(scale, scale, px.toDouble(), py.toDouble(), checkCancelled)
+            fun keep(target: MutableList<Geometry>, candidate: Geometry, limit: Int) {
+                if (candidate.score <= 0 || (target.size == limit && candidate.score <= target.last().score)) return
+                target.add(candidate)
+                target.sortByDescending { it.score }
+                if (target.size > limit) target.removeAt(target.lastIndex)
+            }
+            var phases = 0
+            var reused = 0
+            phaseLoop@ for (py in 0 until CHIP step phaseStep) for (px in 0 until CHIP step phaseStep) {
+                if (SystemClock.elapsedRealtimeNanos() >= deadline) break@phaseLoop
+                budget.check()
+                val key = py * CHIP + px
+                val cached = if (scale == 1.0) originalPhaseCandidates[key] else null
+                if (cached != null) {
+                    reused++
+                    cached.forEach { keep(strongest, it, 32) }
+                    continue
+                }
+                val samples = sample(scale, scale, px.toDouble(), py.toDouble(), budget::check)
                 val averages = DoubleArray(SLOTS) {
                     if (samples.weights[it] > 0) samples.sums[it] / samples.weights[it] else 0.0
                 }
+                val phaseBest = ArrayList<Geometry>()
                 for (cy in 0 until SIDE) {
-                    checkCancelled()
+                    if (SystemClock.elapsedRealtimeNanos() >= deadline) {
+                        phaseBest.forEach { keep(strongest, it, 32) }
+                        break@phaseLoop
+                    }
+                    budget.check()
                     val rows = shiftedCoordinates[cy]
                     for (cx in 0 until SIDE) {
                         val columns = shiftedCoordinates[cx]
@@ -426,28 +448,110 @@ object LocatedWatermarkCodec {
                         }
                         if (count < 32 || Integer.bitCount(observed) < 12) continue
                         val score = sum / count * kotlin.math.sqrt(count / 64.0)
-                        if (score <= 0 || (strongest.size == 32 && score <= strongest.last().score)) continue
-                        strongest.add(Geometry(scale, (px + cx * CHIP).toDouble(),
-                            (py + cy * CHIP).toDouble(), score))
-                        strongest.sortByDescending { it.score }
-                        if (strongest.size > 32) strongest.removeAt(strongest.lastIndex)
+                        keep(phaseBest, Geometry(scale, (px + cx * CHIP).toDouble(),
+                            (py + cy * CHIP).toDouble(), score), 8)
                     }
                 }
+                phases++
+                if (scale == 1.0) originalPhaseCandidates[key] = phaseBest.toList()
+                phaseBest.forEach { keep(strongest, it, 32) }
             }
-            // 相同位置附近的像素相位不应占满四个精校准名额。
             val selected = ArrayList<Geometry>()
+            fun distance(a: Double, b: Double): Double {
+                val d = abs(a - b) % WatermarkLocator.TILE
+                return minOf(d, WatermarkLocator.TILE - d)
+            }
             for (candidate in strongest) {
-                if (selected.all { periodicDistance(it.x, candidate.x) > 4.0 || periodicDistance(it.y, candidate.y) > 4.0 }) {
+                if (selected.all { distance(it.x, candidate.x) > 4 || distance(it.y, candidate.y) > 4 }) {
                     selected.add(candidate)
                     if (selected.size == 4) break
                 }
             }
+            diagnostic("header_positions scale=$scale phaseStep=$phaseStep phases=$phases reused=$reused " +
+                "positions=${selected.size} remainingMs=${budget.remainingMs()}")
             return selected
         }
 
-        private fun periodicDistance(a: Double, b: Double): Double {
-            val distance = abs(a - b) % WatermarkLocator.TILE
-            return minOf(distance, WatermarkLocator.TILE - distance)
+        fun decodePositions(positions: List<Geometry>, adjustScale: Boolean, budget: SearchBudget,
+                            timings: WatermarkTimings?, diagnostic: (String) -> Unit): WatermarkScaleSearch.Result? {
+            var best: WatermarkScaleSearch.Result? = null
+            for (position in positions.take(4)) {
+                budget.check()
+                val geometry = measured("header_position_refinement", diagnostic, timings) {
+                    refineHeader(position, budget::check, adjustScale)
+                }
+                val detection = measured("body_decode", diagnostic, timings) {
+                    inspect(geometry.scale, geometry.scale, geometry.x, geometry.y, budget::check)
+                }
+                diagnostic("position_result scale=${geometry.scale} x=${geometry.x} y=${geometry.y} " +
+                    "score=${geometry.score} status=${detection.status}")
+                val result = WatermarkScaleSearch.Result(detection, geometry.scale)
+                if (detection.payload != null) return result
+                if (best == null || better(detection, best.detection)) best = result
+            }
+            return best
+        }
+
+        fun locateAxes(checkCancelled: () -> Unit, diagnostic: (String) -> Unit): List<WatermarkLocator.Candidate> {
+            axisCandidates?.let {
+                diagnostic("axis_candidates source=cache count=${it.size}")
+                return it
+            }
+            val projections = measured("angle_projection", diagnostic) { projections(checkCancelled) }
+            return measured("angle_scale_position", diagnostic) {
+                WatermarkLocator.locateJoint(projections.first, projections.second, checkCancelled, diagnostic)
+            }.also { axisCandidates = it }
+        }
+
+        /** 频谱角度仅为初值：使用模板横纵分量相位确定位置，再以固定头部精化几何。 */
+        fun detectEstimated(estimatedScale: Double, budget: SearchBudget, timings: WatermarkTimings?,
+                            diagnostic: (String) -> Unit): WatermarkScaleSearch.Result? {
+            val checkCancelled = budget::check
+            val candidates = locateAxes(checkCancelled, diagnostic)
+                .filter { abs(it.x.scale - estimatedScale) < 0.025 }.take(2)
+            var best: WatermarkScaleSearch.Result? = null
+            for (candidate in candidates) {
+                var image = this
+                var geometry = measured("angle_header_position", diagnostic) {
+                    refineHeader(Geometry(candidate.x.scale, candidate.x.offset, candidate.y.offset, 0.0), checkCancelled)
+                }
+                measured("angle_header_refinement", diagnostic, timings) {
+                    for (angleStep in doubleArrayOf(0.1, 0.025, 0.005)) {
+                        val centerImage = image
+                        val center = geometry
+                        for (direction in intArrayOf(-1, 1)) {
+                            checkCancelled()
+                            val degrees = requireNotNull(centerImage.arbitraryDegrees) + direction * angleStep
+                            val rotated = atAngle(degrees)
+                            val alternative = if (horizontalMirrored) rotated.mirrored() else rotated
+                            val seed = center.copy(
+                                x = center.x + (centerImage.width - alternative.width) * center.scale / 2,
+                                y = center.y + (centerImage.height - alternative.height) * center.scale / 2)
+                            val refined = alternative.refineHeader(seed, checkCancelled)
+                            if (refined.score > geometry.score) { image = alternative; geometry = refined }
+                        }
+                    }
+                }
+                val detection = measured("angle_body_decode", diagnostic, timings) {
+                    image.inspect(geometry.scale, geometry.scale, geometry.x, geometry.y, checkCancelled)
+                }
+                diagnostic("angle_result degrees=${detection.rotationDegrees} scale=${geometry.scale} " +
+                    "offsetX=${geometry.x} offsetY=${geometry.y} headerScore=${geometry.score} " +
+                    "status=${detection.status} body=${detection.bodyBitsObserved}/${detection.bodyBitsRequired}")
+                val result = WatermarkScaleSearch.Result(detection, geometry.scale)
+                if (detection.payload != null) return result
+                if (best == null || better(detection, best.detection)) best = result
+            }
+            // 相位只给初值；未认证时在当前角度下限时搜索头部位置，补救裁剪造成的相位误差。
+            if (budget.remainingMs() >= 500) {
+                val scale = candidates.firstOrNull()?.x?.scale ?: estimatedScale
+                val positions = measured("angle_position_search", diagnostic, timings) {
+                    searchHeaderPositions(scale, 2, budget, 650, diagnostic)
+                }
+                val fallback = decodePositions(positions, true, budget, timings, diagnostic)
+                if (fallback != null && (best == null || better(fallback.detection, best.detection))) best = fallback
+            }
+            return best
         }
 
         private fun headerEvidence(geometry: Geometry, checkCancelled: () -> Unit): HeaderEvidence {
@@ -499,78 +603,6 @@ object LocatedWatermarkCodec {
             return best
         }
 
-        suspend fun detectUnscaled(
-            checkCancelled: () -> Unit,
-            onProgress: suspend (String) -> Unit,
-            diagnostic: (String) -> Unit
-        ): Detection? {
-            val candidates = ArrayList<CropCandidate>()
-            diagnostic("unscaled start scale=1.0 phases=144 chipOffsets=3136 limit=24")
-            for (py in 0 until CHIP) {
-                onProgress("正在按原尺寸搜索裁剪位置：${py + 1} / $CHIP")
-                for (px in 0 until CHIP) {
-                    checkCancelled()
-                    val samples = unscaledPhaseSamples[py * CHIP + px] ?:
-                        sample(1.0, 1.0, px.toDouble(), py.toDouble(), checkCancelled)
-                    val averages = DoubleArray(SLOTS) {
-                        if (samples.weights[it] > 0) samples.sums[it] / samples.weights[it] else 0.0
-                    }
-                    for (cy in 0 until SIDE) {
-                        checkCancelled()
-                        val rows = shiftedCoordinates[cy]
-                        for (cx in 0 until SIDE) {
-                            val columns = shiftedCoordinates[cx]
-                            var sum = 0.0
-                            var count = 0
-                            var observed = 0
-                            for (i in magicSlots.indices) {
-                                val slot = magicSlots[i]
-                                val source = rows[slot / SIDE] * SIDE + columns[slot % SIDE]
-                                if (samples.weights[source] > 0) {
-                                    sum += magicSigns[i] * averages[source]
-                                    count++
-                                    observed = observed or (1 shl (i % 16))
-                                }
-                            }
-                            if (count < 64 || Integer.bitCount(observed) < 12) continue
-                            val score = sum / count * kotlin.math.sqrt(count.toDouble() / magicSlots.size)
-                            if (score <= 0 || (candidates.size == 24 && score <= candidates.last().score)) continue
-                            candidates.add(CropCandidate(px, py, cx, cy, score, samples))
-                            candidates.sortByDescending { it.score }
-                            if (candidates.size > 24) candidates.removeAt(candidates.lastIndex)
-                        }
-                    }
-                }
-                diagnostic("unscaled phaseRow=${py + 1}/$CHIP retained=${candidates.size} bestScore=${candidates.firstOrNull()?.score}")
-            }
-            var best: Detection? = null
-            for ((index, candidate) in candidates.withIndex()) {
-                checkCancelled()
-                val sums = DoubleArray(SLOTS)
-                val weights = DoubleArray(SLOTS)
-                for (slot in 0 until SLOTS) {
-                    val source = shiftedCoordinates[candidate.chipY][slot / SIDE] * SIDE +
-                        shiftedCoordinates[candidate.chipX][slot % SIDE]
-                    sums[slot] = candidate.samples.sums[source]
-                    weights[slot] = candidate.samples.weights[source]
-                }
-                val detection = inspect(Samples(sums, weights))
-                diagnostic("unscaled candidate=${index + 1} scale=1.0 " +
-                    "offsetX=${candidate.phaseX + candidate.chipX * CHIP} " +
-                    "offsetY=${candidate.phaseY + candidate.chipY * CHIP} score=${candidate.score} " +
-                    "status=${detection.status} header=${detection.headerBitsObserved}/32 " +
-                    "body=${detection.bodyBitsObserved}/${detection.bodyBitsRequired}")
-                val previous = best
-                if (previous == null || better(detection, previous)) best = detection
-                if (detection.payload != null) {
-                    diagnostic("complete reason=success stage=unscaled scale=1.0")
-                    return detection
-                }
-            }
-            diagnostic("unscaled complete reason=no_authenticated_candidate candidates=${candidates.size} bestStatus=${best?.status}")
-            return best
-        }
-
         fun projections(checkCancelled: () -> Unit): Pair<DoubleArray, DoubleArray> {
             val x = DoubleArray(width)
             val y = DoubleArray(height)
@@ -578,6 +610,13 @@ object LocatedWatermarkCodec {
             for (row in 0 until height) {
                 if (row % 32 == 0) checkCancelled()
                 for (column in 0 until width) {
+                    if (arbitraryDegrees != null) {
+                        val g = channel(column.toDouble(), row.toDouble(), 8)
+                        if (!g.isFinite()) continue
+                        x[column] += channel(column.toDouble(), row.toDouble(), 16) - g
+                        y[row] += channel(column.toDouble(), row.toDouble(), 0) - g
+                        continue
+                    }
                     val pixel = pixelAt(column, row)
                     val g = (pixel ushr 8) and 255
                     x[column] += ((pixel ushr 16) and 255) - g
@@ -590,6 +629,7 @@ object LocatedWatermarkCodec {
         }
 
         private fun green(x: Double, y: Double): Double {
+            if (arbitraryDegrees != null) return channel(x, y, 8)
             val ix = floor(x).toInt()
             val iy = floor(y).toInt()
             val fx = x - ix
@@ -630,6 +670,7 @@ object LocatedWatermarkCodec {
                         val b = green(x1, y0)
                         val c = green(x0, y1)
                         val d = green(x1, y1)
+                        if (!a.isFinite() || !b.isFinite() || !c.isFinite() || !d.isFinite()) continue
                         val gradient = (abs(a - b) + abs(a - c) + abs(b - d) + abs(c - d)) / 4.0
                         val weight = 1.0 / (1.0 + gradient * gradient / (24.0 * 24.0))
                         sums[slot] += (a - b - c + d) / 4.0 * weight
@@ -664,7 +705,7 @@ object LocatedWatermarkCodec {
             fun result(status: Status, observed: Int = 0, required: Int = 0,
                        payload: WatermarkPayload? = null) = Detection(
                 payload, max(0.0, score), status, observedHeader, observed, required, FORMAT,
-                horizontalMirrored, quarterTurns * 90)
+                horizontalMirrored, ((arbitraryDegrees ?: (quarterTurns * 90.0)) % 360 + 360) % 360)
             val header = WatermarkBits.bitsToBytes(IntArray(HEADER_BITS) { if ((headerValues[it] ?: 0.0) > 0) 1 else 0 })
             if ((header[0].toInt() and 255) != (MAGIC ushr 8) ||
                 (header[1].toInt() and 255) != (MAGIC and 255)) return result(Status.NOT_FOUND)

@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="cancel_parse">#FFB4AB</color>
+    <color name="parse_step_pending">#BDBDBD</color>
+    <color name="parse_step_running">#90CAF9</color>
+    <color name="parse_step_completed">#A5D6A7</color>
+    <color name="parse_step_skipped">#FFCC80</color>
 </resources>

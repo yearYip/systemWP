@@ -7,15 +7,13 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-/** 全块双频定位。两个方向在同一补偿比例下联合评分，不再各取前四名后配对。
- * 同步频率在 672 像素内重复 16、21 次；两频联合相位用于恢复块内位置。
+/** 多方向模板的横纵分量定位。两个方向在同一补偿比例下联合评分。
+ * 横纵分量在 672 像素内重复 16、21 次；联合相位用于恢复块内位置。
  */
 internal object WatermarkLocator {
     const val TILE = 672
     private const val MIN_SCORE = 0.08
     private val omega = doubleArrayOf(2.0 * PI * 16 / TILE, 2.0 * PI * 21 / TILE)
-
-    fun signal(position: Double): Double = omega.sumOf { sin(it * position) } * 60.0
 
     data class Axis(val scale: Double, val offset: Double, val score: Double)
     data class Candidate(val x: Axis, val y: Axis, val score: Double)
