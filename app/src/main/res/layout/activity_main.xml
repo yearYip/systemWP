@@ -84,15 +84,6 @@
             android:textSize="13sp"
             android:visibility="gone" />
 
-        <ProgressBar
-            android:id="@+id/progress_parse_steps"
-            style="?android:attr/progressBarStyleHorizontal"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:indeterminate="false"
-            android:visibility="gone" />
-
         <TextView
             android:id="@+id/tv_result"
             android:layout_width="match_parent"
@@ -101,6 +92,16 @@
             android:fontFamily="monospace"
             android:textIsSelectable="true"
             android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_parse_completed_steps"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:lineSpacingExtra="4dp"
+            android:textIsSelectable="true"
+            android:textSize="13sp"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/tv_parse_elapsed"

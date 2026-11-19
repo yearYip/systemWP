@@ -5,4 +5,5 @@
     <color name="parse_step_running">#90CAF9</color>
     <color name="parse_step_completed">#A5D6A7</color>
     <color name="parse_step_skipped">#FFCC80</color>
+    <color name="parse_step_budget_exited">#FFB4AB</color>
 </resources>

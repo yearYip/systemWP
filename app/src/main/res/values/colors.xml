@@ -8,4 +8,5 @@
     <color name="parse_step_running">#1565C0</color>
     <color name="parse_step_completed">#2E7D32</color>
     <color name="parse_step_skipped">#9A5700</color>
+    <color name="parse_step_budget_exited">#B3261E</color>
 </resources>

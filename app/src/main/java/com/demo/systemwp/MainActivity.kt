@@ -21,7 +21,6 @@ import android.util.Log
 import android.view.Display
 import android.widget.Button
 import android.widget.EditText
-import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
@@ -53,10 +52,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvParseElapsed: TextView
     private lateinit var tvParseStep: TextView
     private lateinit var tvParseSteps: TextView
-    private lateinit var progressParseSteps: ProgressBar
+    private lateinit var tvCompletedParseSteps: TextView
     private var lastParseProgress: WatermarkParseProgress? = null
     private val visitedParseStages = mutableSetOf<WatermarkParseProgress.Stage>()
     private val skippedParseStages = mutableSetOf<WatermarkParseProgress.Stage>()
+    private val budgetExitedParseStages = mutableSetOf<WatermarkParseProgress.Stage>()
+    private val completedParseSteps = mutableListOf<WatermarkParseProgress>()
 
     private var startIssued = false
     private var parseJob: Job? = null
@@ -99,13 +100,12 @@ class MainActivity : AppCompatActivity() {
         tvParseElapsed = findViewById(R.id.tv_parse_elapsed)
         tvParseStep = findViewById(R.id.tv_parse_step)
         tvParseSteps = findViewById(R.id.tv_parse_steps)
-        progressParseSteps = findViewById(R.id.progress_parse_steps)
-        progressParseSteps.max = WatermarkParseProgress.Stage.entries.size
+        tvCompletedParseSteps = findViewById(R.id.tv_parse_completed_steps)
         btnCancelParse = findViewById(R.id.btn_cancel_parse)
         btnCancelParse.setOnClickListener {
             parseJob?.cancel()
             finishParseTimer()
-            finishParseProgress()
+            finishParseProgress(cancelled = true)
             btnCancelParse.visibility = android.view.View.GONE
             tvResult.setText(R.string.parse_cancelled)
         }
@@ -254,9 +254,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun showParseProgress(progress: WatermarkParseProgress) {
         val previous = lastParseProgress
+        if (previous != null && (previous.stage != progress.stage ||
+                (previous.frameIndex != null && previous.frameIndex != progress.frameIndex))) {
+            recordCompletedStep(previous)
+        }
         if (previous == null || progress.frameIndex != previous.frameIndex) {
             visitedParseStages.clear()
             skippedParseStages.clear()
+            budgetExitedParseStages.clear()
+        }
+        if (progress.budgetExceeded) {
+            budgetExitedParseStages.add(progress.stage)
+            recordCompletedStep(progress)
         }
         skippedParseStages.addAll(progress.skippedStages)
         if (progress.stage == WatermarkParseProgress.Stage.SCREEN_COMPENSATION) {
@@ -271,13 +280,14 @@ class MainActivity : AppCompatActivity() {
         val frame = if (progress.frameIndex != null && progress.frameCount != null)
             getString(R.string.processing_video, progress.frameIndex, progress.frameCount) + "\n" else ""
         tvParseStep.visibility = android.view.View.VISIBLE
-        progressParseSteps.visibility = android.view.View.VISIBLE
-        val completedCount = visitedParseStages.size - 1 + skippedParseStages.count { it !in visitedParseStages }
+        val runningCount = if (progress.budgetExceeded) 0 else 1
+        val completedCount = visitedParseStages.size - runningCount + skippedParseStages.count { it !in visitedParseStages }
         tvParseStep.text = frame + getString(R.string.parse_step_progress,
-            completedCount, progressParseSteps.max, title)
+            completedCount, WatermarkParseProgress.Stage.entries.size, title)
         val steps = SpannableStringBuilder()
         for (stage in WatermarkParseProgress.Stage.entries) {
             val (status, color) = when {
+                stage in budgetExitedParseStages -> R.string.parse_step_budget_exited to R.color.parse_step_budget_exited
                 stage == progress.stage -> R.string.parse_step_running to R.color.parse_step_running
                 stage in visitedParseStages ->
                     R.string.parse_step_completed to R.color.parse_step_completed
@@ -292,32 +302,81 @@ class MainActivity : AppCompatActivity() {
         }
         tvParseSteps.text = steps
         tvParseSteps.visibility = android.view.View.VISIBLE
-        progressParseSteps.setProgress(completedCount, false)
-        progressParseSteps.secondaryProgress = completedCount + 1
-        progressParseSteps.contentDescription = tvParseStep.text
         tvResult.text = frame + progress.detail.ifBlank { title }
     }
 
-    private fun finishParseProgress() {
+    private fun recordCompletedStep(progress: WatermarkParseProgress) {
+        val last = completedParseSteps.lastOrNull()
+        if (last == null || last.stage != progress.stage || last.frameIndex != progress.frameIndex) {
+            completedParseSteps.add(progress)
+        } else if (progress.budgetExceeded || progress.spectrumChecked) {
+            completedParseSteps[completedParseSteps.lastIndex] = progress
+        }
+    }
+
+    private fun finishParseProgress(cancelled: Boolean = false) {
+        // 取消按钮和任务 finally 都可能调用，保留首次生成的角度和执行记录。
+        if (lastParseProgress == null) return
+        val recordedSteps = completedParseSteps + listOfNotNull(lastParseProgress)
+        val rotationFrames = recordedSteps.filter {
+            it.stage == WatermarkParseProgress.Stage.ROTATION_SEARCH
+        }.map { it.frameIndex }.toSet()
+        val angleEstimates = recordedSteps.filter {
+            it.stage == WatermarkParseProgress.Stage.SPECTRAL_LOCATION &&
+                it.spectrumChecked && it.frameIndex in rotationFrames
+        }.distinctBy { it.frameIndex }
+        // 正常返回包括认证成功和解析失败；取消时不把尚未结束的当前步骤计入完成记录。
+        if (!cancelled) lastParseProgress?.let { recordCompletedStep(it) }
+        tvCompletedParseSteps.text = buildString {
+            if (angleEstimates.isNotEmpty()) {
+                appendLine(getString(R.string.parse_estimated_angles_title))
+                angleEstimates.forEach { progress ->
+                    val angles = if (progress.estimatedAngles.isEmpty()) {
+                        getString(R.string.parse_estimated_angles_empty)
+                    } else progress.estimatedAngles.joinToString("、") { String.format(Locale.US, "%.3f°", it) }
+                    appendLine(if (progress.frameIndex != null) {
+                        getString(R.string.parse_estimated_angles_frame, progress.frameIndex, angles)
+                    } else angles)
+                }
+                appendLine()
+            }
+            appendLine(getString(R.string.parse_completed_steps_title))
+            if (completedParseSteps.isEmpty()) {
+                append(getString(R.string.parse_completed_steps_empty))
+            } else {
+                completedParseSteps.forEachIndexed { index, progress ->
+                    if (index > 0) appendLine()
+                    val stepTitle = if (progress.frameIndex != null) {
+                        getString(R.string.parse_completed_step_frame, progress.frameIndex, stageTitle(progress.stage))
+                    } else stageTitle(progress.stage)
+                    val title = if (progress.budgetExceeded) {
+                        stepTitle + " · " + getString(R.string.parse_step_budget_exited)
+                    } else stepTitle
+                    append(getString(R.string.parse_completed_step_item, index + 1, title))
+                }
+            }
+        }
+        tvCompletedParseSteps.visibility = android.view.View.VISIBLE
         tvParseStep.visibility = android.view.View.GONE
         tvParseSteps.visibility = android.view.View.GONE
-        progressParseSteps.visibility = android.view.View.GONE
         tvParseStep.text = ""
         tvParseSteps.text = ""
-        progressParseSteps.progress = 0
-        progressParseSteps.secondaryProgress = 0
-        progressParseSteps.contentDescription = null
         lastParseProgress = null
         visitedParseStages.clear()
         skippedParseStages.clear()
+        budgetExitedParseStages.clear()
     }
 
     /** 使用单调时钟独立刷新计时，不依赖后台算法发送进度的频率。 */
     private fun startParseTimer() {
         parseTimerJob?.cancel()
+        completedParseSteps.clear()
+        tvCompletedParseSteps.text = ""
+        tvCompletedParseSteps.visibility = android.view.View.GONE
         lastParseProgress = null
         visitedParseStages.clear()
         skippedParseStages.clear()
+        budgetExitedParseStages.clear()
         val startedAt = SystemClock.elapsedRealtime()
         parseStartedAt = startedAt
         tvParseElapsed.visibility = android.view.View.VISIBLE
@@ -357,7 +416,7 @@ class MainActivity : AppCompatActivity() {
             } finally {
                 if (parseJob == currentCoroutineContext()[Job]) {
                     finishParseTimer()
-                    finishParseProgress()
+                    finishParseProgress(cancelled = currentCoroutineContext()[Job]?.isCancelled == true)
                     btnCancelParse.visibility = android.view.View.GONE
                 }
             }
@@ -382,7 +441,7 @@ class MainActivity : AppCompatActivity() {
                 // 被新任务替换后，旧任务不能修改新任务的按钮状态。
                 if (parseJob == currentCoroutineContext()[Job]) {
                     finishParseTimer()
-                    finishParseProgress()
+                    finishParseProgress(cancelled = currentCoroutineContext()[Job]?.isCancelled == true)
                     btnCancelParse.visibility = android.view.View.GONE
                 }
             }

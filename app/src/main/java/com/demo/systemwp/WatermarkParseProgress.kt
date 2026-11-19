@@ -6,7 +6,10 @@ data class WatermarkParseProgress(
     val detail: String = "",
     val frameIndex: Int? = null,
     val frameCount: Int? = null,
-    val skippedStages: Set<Stage> = emptySet()
+    val skippedStages: Set<Stage> = emptySet(),
+    val budgetExceeded: Boolean = false,
+    val estimatedAngles: List<Double> = emptyList(),
+    val spectrumChecked: Boolean = false
 ) {
     enum class Stage {
         READ_IMAGE, DIRECT_READ, HEADER_PROBE, SPECTRAL_LOCATION,

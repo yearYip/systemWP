@@ -64,9 +64,9 @@ object LocatedWatermarkCodec {
     }
 
     private enum class Route(val stage: WatermarkParseProgress.Stage, val budgetMs: Long) {
-        ORIGINAL(WatermarkParseProgress.Stage.ORIGINAL_SEARCH, 2500),
-        SCALED(WatermarkParseProgress.Stage.SCALED_SEARCH, 3500),
-        ROTATION(WatermarkParseProgress.Stage.ROTATION_SEARCH, 6500)
+        ORIGINAL(WatermarkParseProgress.Stage.ORIGINAL_SEARCH, 10000),
+        SCALED(WatermarkParseProgress.Stage.SCALED_SEARCH, 50000),
+        ROTATION(WatermarkParseProgress.Stage.ROTATION_SEARCH, 200000)
     }
 
     // 997 与 3136 互质：一一映射，连续位和重复副本分散到不同位置。
@@ -163,14 +163,13 @@ object LocatedWatermarkCodec {
             normalImage.probeHeader(probeBudget, ::diagnostic)
         }
         val attempted = mutableSetOf<Route>()
-        val skipped = mutableSetOf<WatermarkParseProgress.Stage>()
         var angles = emptyList<WatermarkAngleEstimator.Candidate>()
         suspend fun runRoute(route: Route) {
             if (!attempted.add(route)) return
             val budget = SearchBudget(route.budgetMs, checkCancelled)
             diagnostic("route start=$route budgetMs=${route.budgetMs}")
             suspend fun report(detail: String) {
-                onProgress(WatermarkParseProgress(route.stage, detail, skippedStages = skipped.toSet()))
+                onProgress(WatermarkParseProgress(route.stage, detail))
             }
             measured("route_${route.name.lowercase()}", ::diagnostic, timings) {
                 try {
@@ -210,6 +209,21 @@ object LocatedWatermarkCodec {
                             }
                         }
                         Route.ROTATION -> {
+                            fixedLoop@ for (turns in 1..3) {
+                                for (mirror in listOf(false, true)) {
+                                    budget.check()
+                                    val rotated = normalImage.rotated(turns)
+                                    val image = if (mirror) rotated.mirrored() else rotated
+                                    val label = "${turns * 90}° 镜像=$mirror"
+                                    report("旋转路径：优先尝试固定角度 $label…")
+                                    remember(measured("fixed_angle_alignment direction=$label", ::diagnostic, timings) {
+                                        image.detectFixedDirection(angles.map { it.scale }, budget, timings, ::diagnostic)
+                                    })
+                                    if (best?.detection?.payload != null) break@fixedLoop
+                                }
+                            }
+                            if (best?.detection?.payload != null) return@measured
+                            report("固定角度未认证，继续按频谱角度候选联合校准…")
                             rotationLoop@ for ((index, angle) in angles.take(4).withIndex()) {
                                 for (halfTurn in 0..1) for (mirror in listOf(angle.mirrored, !angle.mirrored)) {
                                     budget.check()
@@ -229,6 +243,9 @@ object LocatedWatermarkCodec {
                     }
                 } catch (_: SearchLimitReached) {
                     diagnostic("route complete=$route reason=time_budget")
+                    onProgress(WatermarkParseProgress(route.stage,
+                        "达到路径预算（${route.budgetMs / 1000} 秒），已退出当前路径，准备回退…",
+                        budgetExceeded = true))
                 }
             }
             diagnostic("route complete=$route authenticated=${best?.detection?.payload != null}")
@@ -247,6 +264,9 @@ object LocatedWatermarkCodec {
             WatermarkAngleEstimator.estimate(normalImage.pixels, bitmap.width, bitmap.height,
                 checkCancelled, ::diagnostic)
         }
+        onProgress(WatermarkParseProgress(WatermarkParseProgress.Stage.SPECTRAL_LOCATION,
+            "频谱预检已结束，正在选择解析路径…",
+            estimatedAngles = angles.map { (it.degrees % 360 + 360) % 360 }, spectrumChecked = true))
         val strongest = angles.firstOrNull()?.takeIf { it.score >= 0.04 }
         val order = when {
             strongest == null -> listOf(Route.ORIGINAL, Route.SCALED, Route.ROTATION)
@@ -257,10 +277,6 @@ object LocatedWatermarkCodec {
         diagnostic("routing headerStrong=${probe.strong} order=${order.joinToString()} " +
             "angle=${strongest?.degrees} scale=${strongest?.scale} mirror=${strongest?.mirrored}")
         for (route in order) {
-            if (route == Route.ROTATION && angles.isEmpty()) {
-                skipped.add(route.stage)
-                continue
-            }
             runRoute(route)
             if (best?.detection?.payload != null) {
                 diagnostic("orientation complete reason=${route.name.lowercase()}_success totalMs=${elapsedMs()}")
@@ -501,6 +517,37 @@ object LocatedWatermarkCodec {
             return measured("angle_scale_position", diagnostic) {
                 WatermarkLocator.locateJoint(projections.first, projections.second, checkCancelled, diagnostic)
             }.also { axisCandidates = it }
+        }
+
+        /** 固定方向优先直接读取，再在该方向下进行有界的尺度和裁剪位置搜索。 */
+        fun detectFixedDirection(estimatedScales: List<Double>, budget: SearchBudget,
+                                 timings: WatermarkTimings?, diagnostic: (String) -> Unit): WatermarkScaleSearch.Result? {
+            budget.check()
+            var best = WatermarkScaleSearch.Result(measured("body_decode", diagnostic, timings) {
+                inspect(1.0, 1.0, 0.0, 0.0, budget::check)
+            }, 1.0)
+            if (best.detection.payload != null) return best
+            val axis = locateAxes(budget::check, diagnostic)
+            val scales = (listOf(1.0) + axis.map { it.x.scale } + estimatedScales)
+                .filter { it in 0.45..1.10 }.fold(mutableListOf<Double>()) { result, scale ->
+                    if (result.none { abs(it - scale) < 0.002 }) result.add(scale)
+                    result
+                }.take(3)
+            for (scale in scales) {
+                val seeds = axis.filter { abs(it.x.scale - scale) < 0.025 }.take(2).map {
+                    Geometry(scale, it.x.offset, it.y.offset, 0.0)
+                }
+                val aligned = decodePositions(seeds, scale != 1.0, budget, timings, diagnostic)
+                if (aligned != null && better(aligned.detection, best.detection)) best = aligned
+                if (best.detection.payload != null) return best
+                val positions = measured("fixed_angle_position_search", diagnostic, timings) {
+                    searchHeaderPositions(scale, 2, budget, 500, diagnostic)
+                }
+                val searched = decodePositions(positions, scale != 1.0, budget, timings, diagnostic)
+                if (searched != null && better(searched.detection, best.detection)) best = searched
+                if (best.detection.payload != null) return best
+            }
+            return best
         }
 
         /** 频谱角度仅为初值：使用模板横纵分量相位确定位置，再以固定头部精化几何。 */

@@ -28,6 +28,14 @@
     <string name="parse_step_running">进行中</string>
     <string name="parse_step_completed">已完成</string>
     <string name="parse_step_skipped">已跳过</string>
+    <string name="parse_step_budget_exited">达到路径预算，已退出</string>
+    <string name="parse_completed_steps_title">步骤执行记录（按结束顺序）：</string>
+    <string name="parse_completed_steps_empty">暂无已完成步骤</string>
+    <string name="parse_completed_step_item">%1$d. %2$s</string>
+    <string name="parse_completed_step_frame">第 %1$d 帧 · %2$s</string>
+    <string name="parse_estimated_angles_title">频谱预检角度（顺时针补偿候选）：</string>
+    <string name="parse_estimated_angles_empty">未得到可用角度候选</string>
+    <string name="parse_estimated_angles_frame">第 %1$d 帧：%2$s</string>
     <string name="parse_elapsed_running">已耗时：%1$.1f 秒</string>
     <string name="parse_elapsed_finished">解析耗时：%1$.1f 秒</string>
     <string name="processing">处理中…</string>
